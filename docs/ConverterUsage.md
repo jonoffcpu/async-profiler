@@ -84,6 +84,7 @@ JFR options:
 
 Flame Graph options:
     --title STRING     Convert to Flame Graph with provided title
+    --units STRING     Counter units displayed by the Flame Graph
     --minwidth X       Skip frames smaller than X%
     --grain X          Coarsen Flame Graph to the given grain size
     --skip N           Skip N bottom frames
@@ -132,6 +133,14 @@ To add a custom title to the generated Flame Graph, use `--title`, which has the
 
 ```
 jfrconv --cpu foo.jfr foo.html -r --title "Custom Title"
+```
+
+When converting a collapsed profile whose counters use application-specific units, use `--units`
+to label the counter correctly in the generated Flame Graph. For example, an off-CPU profile
+weighted in microseconds can be rendered with:
+
+```
+jfrconv --units µs offcpu.collapsed offcpu.html
 ```
 
 ### Differential Flame Graph

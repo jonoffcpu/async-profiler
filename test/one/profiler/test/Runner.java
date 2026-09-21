@@ -130,6 +130,10 @@ public class Runner {
             if (e.getTargetException() instanceof NoClassDefFoundError) {
                 return TestResult.skipMissingJar();
             }
+            if (e.getTargetException() instanceof TestSkippedException) {
+                log.log(Level.INFO, "Skipping " + rt.testInfo() + ": " + e.getTargetException().getMessage());
+                return TestResult.skipUnsupported();
+            }
             return TestResult.fail(e.getTargetException());
         } catch (Throwable e) {
             return TestResult.fail(e);
@@ -174,6 +178,7 @@ public class Runner {
         System.out.println("SKIP (disabled): " + statusCounts.get(TestStatus.SKIP_DISABLED.ordinal()));
         System.out.println("SKIP (config mismatch): " + statusCounts.get(TestStatus.SKIP_CONFIG_MISMATCH.ordinal()));
         System.out.println("SKIP (missing JAR): " + statusCounts.get(TestStatus.SKIP_MISSING_JAR.ordinal()));
+        System.out.println("SKIP (unsupported): " + statusCounts.get(TestStatus.SKIP_UNSUPPORTED.ordinal()));
         System.out.println("TOTAL: " + testCount);
     }
 

@@ -38,6 +38,10 @@ public class TestResult {
         return new TestResult(TestStatus.SKIP_MISSING_JAR, null);
     }
 
+    public static TestResult skipUnsupported() {
+        return new TestResult(TestStatus.SKIP_UNSUPPORTED, null);
+    }
+
     public static TestResult pass() {
         return new TestResult(TestStatus.PASS, null);
     }

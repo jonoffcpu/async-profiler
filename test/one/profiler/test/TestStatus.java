@@ -11,4 +11,5 @@ public enum TestStatus {
     SKIP_DISABLED,
     SKIP_CONFIG_MISMATCH,
     SKIP_MISSING_JAR,
+    SKIP_UNSUPPORTED,
 }

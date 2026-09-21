@@ -1,5 +1,14 @@
 # Async-profiler
 
+> [!NOTE]
+> This is a fork of [async-profiler](https://github.com/async-profiler/async-profiler) that adds
+> externally triggered signal profiling for use by [lhotari/jonoffcpu](https://github.com/lhotari/jonoffcpu).
+> jonoffcpu contains an eBPF program that samples off-CPU intervals from the Linux scheduler and
+> sends the resumed thread a signal carrying a 64-bit correlation id. This fork records that id
+> together with the thread's stack as a `profiler.SignalSample` JFR event, so the scheduler data
+> and the JVM stacks can be joined offline. See
+> [Correlated external signal samples](docs/ProfilerOptions.md#correlated-external-signal-samples).
+
 This project is a low overhead sampling profiler for Java
 that does not suffer from the [Safepoint bias problem](http://psy-lob-saw.blogspot.ru/2016/02/why-most-sampling-java-profilers-are.html).
 It features HotSpot-specific API to collect stack traces

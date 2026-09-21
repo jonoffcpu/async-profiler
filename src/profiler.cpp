@@ -37,6 +37,7 @@
 #include "otlp.h"
 #include "rateLimit.h"
 #include "safeAccess.h"
+#include "signalEvent.h"
 #include "stackFrame.h"
 #include "stackWalker.h"
 #include "symbols.h"
@@ -67,6 +68,7 @@ static J9WallClock j9_wall_clock;
 static CTimer ctimer;
 static ITimer itimer;
 static Instrument instrument;
+static SignalEvent signal_event;
 
 static SpanEvent profiling_window;
 
@@ -789,6 +791,8 @@ Engine* Profiler::selectEngine(Arguments& args) {
         return &ctimer;
     } else if (strcmp(event_name, EVENT_ITIMER) == 0) {
         return &itimer;
+    } else if (strcmp(event_name, EVENT_SIGNAL) == 0) {
+        return &signal_event;
     } else if (strchr(event_name, '.') != NULL && strchr(event_name, ':') == NULL) {
         return &instrument;
     } else {
@@ -1624,6 +1628,7 @@ Error Profiler::runInternal(Arguments& args, Writer& out) {
             out << "  " << EVENT_NATIVELOCK << "\n";
             out << "  " << EVENT_WALL << "\n";
             out << "  " << EVENT_ITIMER << "\n";
+            out << "  " << EVENT_SIGNAL << "\n";
             if (CTimer::supported()) {
                 out << "  " << EVENT_CTIMER << "\n";
             }

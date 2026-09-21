@@ -24,6 +24,7 @@ const char* const EVENT_NATIVELOCK = "nativelock";
 const char* const EVENT_WALL       = "wall";
 const char* const EVENT_CTIMER     = "ctimer";
 const char* const EVENT_ITIMER     = "itimer";
+const char* const EVENT_SIGNAL     = "signal";
 
 #define SHORT_ENUM __attribute__((__packed__))
 

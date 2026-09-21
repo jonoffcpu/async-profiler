@@ -137,3 +137,12 @@ TEST_CASE(Parse_ratelimit_invalid) {
         ASSERT_EQ(strcmp(error.message(), "Invalid ratelimit"), 0);
     }
 }
+
+TEST_CASE(Parse_external_signal_event) {
+    Arguments args;
+    char argument[] = "start,event=signal,interval=25ms";
+    Error error = args.parse(argument);
+    ASSERT_EQ(error.message(), NULL);
+    ASSERT_EQ(args._event, EVENT_SIGNAL);
+    ASSERT_EQ(args._interval, 25000000);
+}

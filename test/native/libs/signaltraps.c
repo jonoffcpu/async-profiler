@@ -25,6 +25,10 @@ JNIEXPORT jint JNICALL Java_test_signal_SignalCookieMaskApp_currentThreadId(JNIE
 #endif
 }
 
+JNIEXPORT jint JNICALL Java_test_signal_SignalCookieGateApp_currentThreadId(JNIEnv* env, jclass cls) {
+    return Java_test_signal_SignalCookieMaskApp_currentThreadId(env, cls);
+}
+
 JNIEXPORT jint JNICALL Java_test_signal_SignalCookieMaskApp_setSignalBlocked(
         JNIEnv* env, jclass cls, jint signal, jboolean blocked) {
     sigset_t set;

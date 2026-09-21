@@ -5,11 +5,20 @@
 
 package test.signal;
 
+import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import jdk.jfr.consumer.RecordedEvent;
@@ -25,6 +34,7 @@ import one.profiler.test.Os;
 import one.profiler.test.Output;
 import one.profiler.test.Test;
 import one.profiler.test.TestProcess;
+import one.profiler.test.TestSkippedException;
 import test.cpu.CpuBurner;
 
 public class SignalTests {
@@ -359,6 +369,127 @@ public class SignalTests {
         Assert.isEqual(p.exitCode(), 0, "target must survive delayed stale cookie delivery");
     }
 
+    @Test(mainClass = SignalCookieGateApp.class, args = "%gate_tid",
+            env = {"ASYNC_PROFILER_SIGNAL_GATE_TEST=%gate_control"},
+            os = Os.LINUX, jvmVer = {17, Integer.MAX_VALUE}, runIsolated = true)
+    public void signalCookieStopDrainsAdmittedHandlersBeforeReopen(TestProcess p) throws Exception {
+        int tid = awaitThreadId(Path.of(p.getFilePath("%gate_tid")));
+        List<Long> oldEpochs = new ArrayList<>();
+        List<Long> closedCookies = new ArrayList<>();
+
+        try (SignalGateControl gate = new SignalGateControl(Path.of(p.getFilePath("%gate_control")))) {
+            for (int point = 1; point <= 3; point++) {
+                String id = String.format("10000000-0000-0000-0000-%012d", point);
+                String fileId = "%gate" + point;
+                p.profile("start -e signal -o jfr -f " + fileId + ".jfr"
+                        + " --signalcookie --signalid " + id);
+                gate.requireAttached();
+                Output status = p.profile("status --signalcookie");
+                Matcher matcher = Pattern.compile("signal=(\\d+) epoch=(\\d+)").matcher(status.toString());
+                assert matcher.find() : status;
+                int signal = Integer.parseInt(matcher.group(1));
+                long epoch = Long.parseLong(matcher.group(2));
+
+                if (!oldEpochs.isEmpty()) {
+                    long staleCookie = (oldEpochs.get(oldEpochs.size() - 1) << 32) | (0x40L + point);
+                    sendCookieToThread(p, signal, staleCookie, tid);
+                    Thread.sleep(50);
+                }
+
+                int token = 100 + point;
+                gate.arm(point, token);
+                long recordedCookie = (epoch << 32) | point;
+                sendCookieToThread(p, signal, recordedCookie, tid);
+                gate.await(SignalGateControl.REACHED_TOKEN, token, "handler pause point " + point);
+                if (point >= 2) {
+                    Assert.isEqual(gate.read(SignalGateControl.OBSERVED_EPOCH), (int)epoch,
+                            "handler must retain the admitted capture epoch");
+                }
+
+                ExecutorService executor = Executors.newSingleThreadExecutor();
+                try {
+                    Future<Output> stopping = executor.submit(() -> p.profile(
+                            "stop --signalcookie --signalid " + id + " --signalepoch " + epoch));
+                    gate.await(SignalGateControl.CLOSED_TOKEN, token, "closed admission gate");
+                    Assert.isEqual(gate.read(SignalGateControl.CLOSED_EPOCH), (int)epoch,
+                            "stop must not replace the old epoch before draining");
+                    Assert.isEqual(gate.read(SignalGateControl.CLOSED_READY), 1,
+                            "the admitted handler must retain the active recording at gate close");
+                    Assert.isEqual(gate.read(SignalGateControl.DRAINED_TOKEN), 0,
+                            "drain must wait for the paused handler");
+                    Assert.isEqual(gate.read(SignalGateControl.STATS_TOKEN), 0,
+                            "terminal stats must wait for handler drain");
+                    Assert.isEqual(gate.read(SignalGateControl.FINALIZED_TOKEN), 0,
+                            "JFR finalization must wait for handler drain");
+                    Thread.sleep(100);
+                    assert !stopping.isDone() : "stop returned while an admitted handler was paused";
+
+                    long closedCookie = (epoch << 32) | (0x80L + point);
+                    closedCookies.add(closedCookie);
+                    sendCookieToThread(p, signal, closedCookie, tid);
+                    assert !stopping.isDone() : "a closed-gate arrival must not release stop";
+
+                    gate.release(token);
+                    Output stopped = stopping.get(10, TimeUnit.SECONDS);
+                    int expectedAdmitted = oldEpochs.isEmpty() ? 1 : 2;
+                    int expectedStale = oldEpochs.isEmpty() ? 0 : 1;
+                    assert stopped.contains("admitted=" + expectedAdmitted) : stopped;
+                    assert stopped.contains("stale-epoch=" + expectedStale) : stopped;
+                    assert stopped.contains("accepted=1") : stopped;
+                    assert stopped.contains("submitted=1") : stopped;
+                    assert stopped.contains("finalized=true") : stopped;
+
+                    gate.await(SignalGateControl.DRAINED_TOKEN, token, "handler drain");
+                    gate.await(SignalGateControl.RECORDED_TOKEN, token, "old-recording sample write");
+                    gate.await(SignalGateControl.STATS_TOKEN, token, "terminal stats write");
+                    gate.await(SignalGateControl.FINALIZED_TOKEN, token, "JFR finalization");
+                    Assert.isEqual(gate.read(SignalGateControl.DRAINED_EPOCH), (int)epoch,
+                            "the old epoch must remain published through drain");
+                    Assert.isEqual(gate.read(SignalGateControl.DRAINED_READY), 1,
+                            "the old recording must remain active through drain");
+                    assert gate.read(SignalGateControl.CLOSED_ORDER)
+                            < gate.read(SignalGateControl.DRAINED_ORDER);
+                    assert gate.read(SignalGateControl.DRAINED_ORDER)
+                            < gate.read(SignalGateControl.STATS_ORDER);
+                    assert gate.read(SignalGateControl.STATS_ORDER)
+                            < gate.read(SignalGateControl.FINALIZED_ORDER);
+
+                    verifyGateJfr(Path.of(p.getFilePath(fileId)), recordedCookie,
+                            expectedAdmitted, expectedStale, closedCookies);
+                } finally {
+                    executor.shutdownNow();
+                }
+
+                gate.disarm();
+                oldEpochs.add(epoch);
+                Thread.sleep(100);
+            }
+
+            String finalId = "10000000-0000-0000-0000-000000000004";
+            p.profile("start -e signal -o jfr -f %gate4.jfr"
+                    + " --signalcookie --signalid " + finalId);
+            Output finalStatus = p.profile("status --signalcookie");
+            Matcher finalMatcher = Pattern.compile("signal=(\\d+) epoch=(\\d+)").matcher(finalStatus.toString());
+            assert finalMatcher.find() : finalStatus;
+            int signal = Integer.parseInt(finalMatcher.group(1));
+            long epoch = Long.parseLong(finalMatcher.group(2));
+            for (int i = 0; i < oldEpochs.size(); i++) {
+                sendCookieToThread(p, signal, (oldEpochs.get(i) << 32) | (0xc0L + i), tid);
+                Thread.sleep(25);
+            }
+            long finalCookie = (epoch << 32) | 1;
+            sendCookieToThread(p, signal, finalCookie, tid);
+            Thread.sleep(50);
+            Output finalStop = p.profile("stop --signalcookie --signalid " + finalId
+                    + " --signalepoch " + epoch);
+            assert finalStop.contains("admitted=4") : finalStop;
+            assert finalStop.contains("stale-epoch=3") : finalStop;
+            assert finalStop.contains("accepted=1") : finalStop;
+            assert finalStop.contains("submitted=1") : finalStop;
+            verifyGateJfr(Path.of(p.getFilePath("%gate4")), finalCookie, 4, 3, closedCookies);
+        }
+    }
+
     private static void sendCookie(TestProcess p, int signal, long cookie) throws Exception {
         Process sender = new ProcessBuilder(p.testBinPath() + "/signal_cookie",
                 Long.toString(p.pid()), Integer.toString(signal), Long.toUnsignedString(cookie)).start();
@@ -384,6 +515,17 @@ public class SignalTests {
         throw new AssertionError("Signal mask status did not become " + expected + ": " + Files.readString(path));
     }
 
+    private static int awaitThreadId(Path path) throws Exception {
+        for (int i = 0; i < 500; i++) {
+            String value = Files.readString(path).strip();
+            if (!value.isEmpty()) {
+                return Integer.parseInt(value);
+            }
+            Thread.sleep(10);
+        }
+        throw new AssertionError("Target thread ID was not published");
+    }
+
     private static void expectProfileFailure(TestProcess p, String command) throws Exception {
         try {
             p.profile(command);
@@ -402,6 +544,128 @@ public class SignalTests {
         return RecordingFile.readAllEvents(path).stream()
                 .filter(event -> event.getEventType().getName().equals(eventName))
                 .count();
+    }
+
+    private static void verifyGateJfr(Path path, long expectedCookie, long admitted, long stale,
+                                      List<Long> closedCookies) throws Exception {
+        List<RecordedEvent> events = RecordingFile.readAllEvents(path);
+        List<Long> cookies = new ArrayList<>();
+        int statsCount = 0;
+        for (int i = 0; i < events.size(); i++) {
+            RecordedEvent event = events.get(i);
+            if (event.getEventType().getName().equals("profiler.SignalSample")) {
+                cookies.add(event.getLong("correlationId"));
+            } else if (event.getEventType().getName().equals("profiler.SignalCaptureStats")) {
+                statsCount++;
+                Assert.isEqual(event.getLong("admittedSignals"), admitted,
+                        "JFR stats must match the drained handler count");
+                Assert.isEqual(event.getLong("staleEpoch"), stale,
+                        "JFR stats must count only arrivals admitted in this epoch");
+                Assert.isEqual(event.getLong("acceptedCookies"), 1,
+                        "exactly one current-epoch cookie must be accepted");
+                Assert.isEqual(event.getLong("submittedSamples"), 1,
+                        "exactly one current-epoch sample must be submitted");
+            }
+        }
+        Assert.isEqual(cookies.size(), 1, "old recording must contain its admitted sample only");
+        Assert.isEqual(cookies.get(0), expectedCookie, "recording must retain the admitted cookie");
+        Assert.isEqual(statsCount, 1, "recording must contain exactly one terminal stats event");
+        for (long closedCookie : closedCookies) {
+            assert !cookies.contains(closedCookie) : "closed-gate cookie leaked into a recording";
+        }
+    }
+
+    private static final class SignalGateControl implements AutoCloseable {
+        static final int REACHED_TOKEN = 4;
+        static final int OBSERVED_EPOCH = 6;
+        static final int CLOSED_TOKEN = 7;
+        static final int CLOSED_EPOCH = 8;
+        static final int CLOSED_READY = 9;
+        static final int DRAINED_TOKEN = 10;
+        static final int DRAINED_EPOCH = 11;
+        static final int DRAINED_READY = 12;
+        static final int RECORDED_TOKEN = 13;
+        static final int STATS_TOKEN = 14;
+        static final int FINALIZED_TOKEN = 15;
+        static final int CLOSED_ORDER = 17;
+        static final int DRAINED_ORDER = 18;
+        static final int STATS_ORDER = 19;
+        static final int FINALIZED_ORDER = 20;
+        static final int ATTACHED = 21;
+
+        private final RandomAccessFile file;
+        private final FileChannel channel;
+
+        SignalGateControl(Path path) throws Exception {
+            file = new RandomAccessFile(path.toFile(), "rw");
+            file.setLength(4096);
+            channel = file.getChannel();
+            write(0, 0x53474654);
+            write(1, 1);
+        }
+
+        void arm(int point, int token) throws Exception {
+            for (int field = REACHED_TOKEN; field <= FINALIZED_ORDER; field++) {
+                write(field, 0);
+            }
+            write(2, point);
+            write(3, token);
+            channel.force(false);
+        }
+
+        void release(int token) throws Exception {
+            write(5, token);
+            channel.force(false);
+        }
+
+        void disarm() throws Exception {
+            write(2, 0);
+            write(3, 0);
+            channel.force(false);
+        }
+
+        // The profiler maps this page when it publishes a cookie capture, but
+        // only test builds (-DASYNC_PROFILER_TEST) contain the pause points.
+        void requireAttached() throws Exception {
+            if (read(ATTACHED) != 1) {
+                throw new TestSkippedException("profiler library was built without the signal test gate");
+            }
+        }
+
+        void await(int field, int expected, String milestone) throws Exception {
+            for (int i = 0; i < 500; i++) {
+                if (read(field) == expected) return;
+                Thread.sleep(10);
+            }
+            throw new AssertionError("Timed out waiting for " + milestone + ": " + read(field));
+        }
+
+        int read(int field) throws Exception {
+            ByteBuffer value = ByteBuffer.allocate(4).order(ByteOrder.nativeOrder());
+            int offset = field * Integer.BYTES;
+            while (value.hasRemaining()) {
+                if (channel.read(value, offset + value.position()) < 0) {
+                    throw new AssertionError("Unexpected EOF in signal gate control page");
+                }
+            }
+            value.flip();
+            return value.getInt();
+        }
+
+        void write(int field, int value) throws Exception {
+            ByteBuffer bytes = ByteBuffer.allocate(4).order(ByteOrder.nativeOrder());
+            bytes.putInt(value).flip();
+            int offset = field * Integer.BYTES;
+            while (bytes.hasRemaining()) {
+                channel.write(bytes, offset + bytes.position());
+            }
+        }
+
+        @Override
+        public void close() throws Exception {
+            channel.close();
+            file.close();
+        }
     }
 
     private static void triggerAndAwait(TestProcess p, String fileId) throws Exception {

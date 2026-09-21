@@ -5,7 +5,13 @@
 
 #include <errno.h>
 #include <sched.h>
+#include <stdlib.h>
 #include <string.h>
+#if defined(ASYNC_PROFILER_TEST) && defined(__linux__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include "event.h"
 #include "log.h"
 #include "os.h"
@@ -21,6 +27,121 @@ long SignalEvent::_interval;
 volatile u64 SignalEvent::_last_sample;
 static const u64 SIGNAL_HANDLER_GATE_CLOSED = 1ULL << 63;
 static const u64 SIGNAL_HANDLER_GATE_COUNT_MASK = SIGNAL_HANDLER_GATE_CLOSED - 1;
+
+#if defined(ASYNC_PROFILER_TEST) && defined(__linux__)
+// Shared only by test builds. A separate test process controls this page so it
+// can release a paused signal handler while the normal attach command is
+// blocked in stop(). Production builds contain neither the checks nor mapping.
+static const u32 SIGNAL_TEST_GATE_MAGIC = 0x53474654;
+static const u32 SIGNAL_TEST_GATE_VERSION = 1;
+
+enum SignalTestPausePoint {
+    SIGNAL_TEST_AFTER_ADMISSION = 1,
+    SIGNAL_TEST_AFTER_EPOCH_READ = 2,
+    SIGNAL_TEST_BEFORE_RECORDING = 3,
+};
+
+struct SignalTestGate {
+    volatile u32 magic;
+    volatile u32 version;
+    volatile u32 requested_point;
+    volatile u32 requested_token;
+    volatile u32 reached_token;
+    volatile u32 release_token;
+    volatile u32 observed_epoch;
+    volatile u32 closed_token;
+    volatile u32 closed_epoch;
+    volatile u32 closed_ready;
+    volatile u32 drained_token;
+    volatile u32 drained_epoch;
+    volatile u32 drained_ready;
+    volatile u32 recorded_token;
+    volatile u32 stats_token;
+    volatile u32 finalized_token;
+    volatile u32 milestone_sequence;
+    volatile u32 closed_order;
+    volatile u32 drained_order;
+    volatile u32 stats_order;
+    volatile u32 finalized_order;
+    volatile u32 attached;
+};
+
+static SignalTestGate* _signal_test_gate;
+
+static void initializeSignalTestGate() {
+    if (_signal_test_gate != NULL) return;
+
+    const char* path = getenv("ASYNC_PROFILER_SIGNAL_GATE_TEST");
+    if (path == NULL || *path == 0) return;
+
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return;
+
+    void* page = mmap(NULL, sizeof(SignalTestGate), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (page == MAP_FAILED) return;
+
+    SignalTestGate* gate = (SignalTestGate*)page;
+    if (__atomic_load_n(&gate->magic, __ATOMIC_ACQUIRE) != SIGNAL_TEST_GATE_MAGIC ||
+            __atomic_load_n(&gate->version, __ATOMIC_RELAXED) != SIGNAL_TEST_GATE_VERSION) {
+        munmap(page, sizeof(SignalTestGate));
+        return;
+    }
+    // Tell the controlling test that this build has the pause points, so it
+    // can skip instead of timing out against a production library.
+    __atomic_store_n(&gate->attached, 1, __ATOMIC_RELEASE);
+    _signal_test_gate = gate;
+}
+
+static u32 signalTestToken() {
+    SignalTestGate* gate = _signal_test_gate;
+    return gate == NULL ? 0 : __atomic_load_n(&gate->requested_token, __ATOMIC_ACQUIRE);
+}
+
+static u32 signalTestNextOrder() {
+    return __atomic_add_fetch(&_signal_test_gate->milestone_sequence, 1, __ATOMIC_RELAXED);
+}
+
+static void signalTestPause(u32 point, u32 epoch) {
+    SignalTestGate* gate = _signal_test_gate;
+    if (gate == NULL || __atomic_load_n(&gate->requested_point, __ATOMIC_ACQUIRE) != point) return;
+
+    u32 token = __atomic_load_n(&gate->requested_token, __ATOMIC_ACQUIRE);
+    if (token == 0) return;
+
+    if (epoch != 0) {
+        __atomic_store_n(&gate->observed_epoch, epoch, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&gate->reached_token, token, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&gate->release_token, __ATOMIC_ACQUIRE) != token) {
+        // Test-only deterministic pause in the sampled thread.
+    }
+}
+
+static void signalTestGateClosed(u32 token, u32 epoch, bool ready) {
+    SignalTestGate* gate = _signal_test_gate;
+    if (gate == NULL || token == 0) return;
+    __atomic_store_n(&gate->closed_epoch, epoch, __ATOMIC_RELAXED);
+    __atomic_store_n(&gate->closed_ready, ready ? 1 : 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&gate->closed_order, signalTestNextOrder(), __ATOMIC_RELAXED);
+    __atomic_store_n(&gate->closed_token, token, __ATOMIC_RELEASE);
+}
+
+static void signalTestGateDrained(u32 token, u32 epoch, bool ready) {
+    SignalTestGate* gate = _signal_test_gate;
+    if (gate == NULL || token == 0) return;
+    __atomic_store_n(&gate->drained_epoch, epoch, __ATOMIC_RELAXED);
+    __atomic_store_n(&gate->drained_ready, ready ? 1 : 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&gate->drained_order, signalTestNextOrder(), __ATOMIC_RELAXED);
+    __atomic_store_n(&gate->drained_token, token, __ATOMIC_RELEASE);
+}
+
+static void signalTestMilestone(volatile u32* field, u32 token) {
+    if (_signal_test_gate != NULL && token != 0) {
+        __atomic_store_n(field, token, __ATOMIC_RELEASE);
+    }
+}
+#endif
 
 volatile u64 SignalEvent::_handler_gate = SIGNAL_HANDLER_GATE_CLOSED;
 volatile u64 SignalEvent::_cookie_handler_gate = SIGNAL_HANDLER_GATE_CLOSED;
@@ -88,6 +209,9 @@ void SignalEvent::cookieSignalHandler(int signo, siginfo_t* siginfo, void* ucont
         errno = saved_errno;
         return;
     }
+#if defined(ASYNC_PROFILER_TEST) && defined(__linux__)
+    signalTestPause(SIGNAL_TEST_AFTER_ADMISSION, 0);
+#endif
 
     u64 signal_ticks = TSC::ticks();
     u64 now = OS::nanotime();
@@ -109,7 +233,11 @@ void SignalEvent::cookieSignalHandler(int signo, siginfo_t* siginfo, void* ucont
         leaveCookieSignalHandler(saved_errno);
         return;
     }
-    if ((u32)(cookie >> 32) != __atomic_load_n(&_capture_epoch, __ATOMIC_RELAXED)) {
+    u32 active_epoch = __atomic_load_n(&_capture_epoch, __ATOMIC_RELAXED);
+#if defined(ASYNC_PROFILER_TEST) && defined(__linux__)
+    signalTestPause(SIGNAL_TEST_AFTER_EPOCH_READ, active_epoch);
+#endif
+    if ((u32)(cookie >> 32) != active_epoch) {
         __atomic_add_fetch(&_stale_epoch, 1, __ATOMIC_RELAXED);
         leaveCookieSignalHandler(saved_errno);
         return;
@@ -117,11 +245,20 @@ void SignalEvent::cookieSignalHandler(int signo, siginfo_t* siginfo, void* ucont
 
     __atomic_add_fetch(&_accepted_cookies, 1, __ATOMIC_RELAXED);
     SignalSampleEvent signal_event(signal_ticks, cookie, now);
+#if defined(ASYNC_PROFILER_TEST) && defined(__linux__)
+    signalTestPause(SIGNAL_TEST_BEFORE_RECORDING, active_epoch);
+    u32 test_token = signalTestToken();
+#endif
     if (Profiler::instance()->recordSample(ucontext, 1, SIGNAL_SAMPLE, &signal_event) == 0) {
         __atomic_add_fetch(&_capture_failures, 1, __ATOMIC_RELAXED);
     } else {
         __atomic_add_fetch(&_submitted_samples, 1, __ATOMIC_RELAXED);
     }
+#if defined(ASYNC_PROFILER_TEST) && defined(__linux__)
+    if (_signal_test_gate != NULL) {
+        signalTestMilestone(&_signal_test_gate->recorded_token, test_token);
+    }
+#endif
     leaveCookieSignalHandler(saved_errno);
 }
 
@@ -219,6 +356,9 @@ Error SignalEvent::reserveCookieCapture(Arguments& args) {
 }
 
 void SignalEvent::publishCookieCapture() {
+#if defined(ASYNC_PROFILER_TEST) && defined(__linux__)
+    initializeSignalTestGate();
+#endif
     _capture_ready = true;
     __atomic_store_n(&_cookie_handler_gate, 0, __ATOMIC_RELEASE);
 }
@@ -248,6 +388,12 @@ SignalCaptureStats SignalEvent::captureStats() {
 void SignalEvent::recordCaptureStats() {
     Profiler::instance()->jfr()->recordSignalCaptureStats(
         _session_id, captureEpoch(), _stopped_stats);
+#if defined(ASYNC_PROFILER_TEST) && defined(__linux__)
+    if (_signal_test_gate != NULL) {
+        __atomic_store_n(&_signal_test_gate->stats_order, signalTestNextOrder(), __ATOMIC_RELAXED);
+        signalTestMilestone(&_signal_test_gate->stats_token, signalTestToken());
+    }
+#endif
 }
 
 void SignalEvent::writeCaptureStatus(Writer& out) {
@@ -292,6 +438,12 @@ void SignalEvent::finishCookieCapture(bool finalized, const char* reason) {
     _terminal_valid = true;
     __atomic_store_n(&_capture_epoch, 0, __ATOMIC_RELAXED);
     _session_id[0] = 0;
+#if defined(ASYNC_PROFILER_TEST) && defined(__linux__)
+    if (_signal_test_gate != NULL) {
+        __atomic_store_n(&_signal_test_gate->finalized_order, signalTestNextOrder(), __ATOMIC_RELAXED);
+        signalTestMilestone(&_signal_test_gate->finalized_token, signalTestToken());
+    }
+#endif
 }
 
 SignalCookieLookup SignalEvent::lookupCapture(const char* id, u64 epoch) {
@@ -373,6 +525,10 @@ void SignalEvent::closeSignalHandlerGate() {
 
 u64 SignalEvent::closeCookieSignalHandlerGate() {
     __atomic_fetch_or(&_cookie_handler_gate, SIGNAL_HANDLER_GATE_CLOSED, __ATOMIC_ACQ_REL);
+#if defined(ASYNC_PROFILER_TEST) && defined(__linux__)
+    u32 test_token = signalTestToken();
+    signalTestGateClosed(test_token, captureEpoch(), _capture_ready);
+#endif
     // This is the admission cutoff: after CLOSED is visible, no new handler can
     // enter. Existing handlers may still be draining when the timestamp is read.
     u64 stopped_at = OS::nanotime();
@@ -380,6 +536,9 @@ u64 SignalEvent::closeCookieSignalHandlerGate() {
             SIGNAL_HANDLER_GATE_COUNT_MASK) != 0) {
         sched_yield();
     }
+#if defined(ASYNC_PROFILER_TEST) && defined(__linux__)
+    signalTestGateDrained(test_token, captureEpoch(), _capture_ready);
+#endif
     return stopped_at;
 }
 

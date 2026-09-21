@@ -82,6 +82,9 @@ public class JfrReader implements Closeable {
     private int free;
     private int cpuTimeSample;
     private int nativeLock;
+    private int signalSample;
+    private int signalCapture;
+    private int signalCaptureStats;
     private boolean hasWallTimeSpan;
 
     public JfrReader(String fileName) throws IOException {
@@ -207,6 +210,12 @@ public class JfrReader implements Closeable {
 
             if (type == executionSample || type == nativeMethodSample) {
                 if (cls == null || cls == ExecutionSample.class) return (E) readExecutionSample(false);
+            } else if (type == signalSample) {
+                if (cls == null || cls == SignalSample.class) return (E) readSignalSample();
+            } else if (type == signalCapture) {
+                if (cls == null || cls == SignalCapture.class) return (E) readSignalCapture();
+            } else if (type == signalCaptureStats) {
+                if (cls == null || cls == SignalCaptureStats.class) return (E) readSignalCaptureStats();
             } else if (type == wallClockSample) {
                 if (cls == null || cls == ExecutionSample.class) return (E) readExecutionSample(true);
             } else if (type == allocationInNewTLAB) {
@@ -263,6 +272,46 @@ public class JfrReader implements Closeable {
         int samples = wall ? getVarint() : 1;
         if (wall && hasWallTimeSpan) getVarlong(); // timeSpan is ignored
         return new ExecutionSample(time, tid, stackTraceId, threadState, samples);
+    }
+
+    private SignalSample readSignalSample() {
+        long time = getVarlong();
+        int tid = getVarint();
+        int stackTraceId = getVarint();
+        long correlationId = getVarlong();
+        long monotonicTimeNanos = getVarlong();
+        return new SignalSample(time, tid, stackTraceId, correlationId, monotonicTimeNanos);
+    }
+
+    private SignalCapture readSignalCapture() {
+        long time = getVarlong();
+        int schemaVersion = getVarint();
+        String sessionId = getString();
+        long captureEpoch = getVarlong();
+        int signal = getVarint();
+        String signalDelivery = getString();
+        long processId = getVarlong();
+        long processStartTimeMillis = getVarlong();
+        return new SignalCapture(time, schemaVersion, sessionId, captureEpoch, signal,
+                signalDelivery, processId, processStartTimeMillis);
+    }
+
+    private SignalCaptureStats readSignalCaptureStats() {
+        long time = getVarlong();
+        int schemaVersion = getVarint();
+        String sessionId = getString();
+        long captureEpoch = getVarlong();
+        long admittedSignals = getVarlong();
+        long invalidSignalCode = getVarlong();
+        long zeroCookie = getVarlong();
+        long zeroSequence = getVarlong();
+        long staleEpoch = getVarlong();
+        long acceptedCookies = getVarlong();
+        long captureFailures = getVarlong();
+        long submittedSamples = getVarlong();
+        return new SignalCaptureStats(time, schemaVersion, sessionId, captureEpoch,
+                admittedSignals, invalidSignalCode, zeroCookie, zeroSequence, staleEpoch,
+                acceptedCookies, captureFailures, submittedSamples);
     }
 
     private AllocationSample readAllocationSample(boolean tlab) {
@@ -650,6 +699,9 @@ public class JfrReader implements Closeable {
         free = getTypeId("profiler.Free");
         cpuTimeSample = getTypeId("jdk.CPUTimeSample");
         nativeLock = getTypeId("profiler.NativeLock");
+        signalSample = getTypeId("profiler.SignalSample");
+        signalCapture = getTypeId("profiler.SignalCapture");
+        signalCaptureStats = getTypeId("profiler.SignalCaptureStats");
 
         JfrClass wallClass = typesByName.get("profiler.WallClockSample");
         hasWallTimeSpan = wallClass != null && wallClass.field("timeSpan") != null;

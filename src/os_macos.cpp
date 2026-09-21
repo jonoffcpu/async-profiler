@@ -311,6 +311,14 @@ int OS::getProfilingSignal(int mode) {
     return signo;
 }
 
+int OS::reserveCookieSignal(int requested, int primary_signals, bool coalescing, SigAction action) {
+    return 0;
+}
+
+int OS::cookieSignal() {
+    return 0;
+}
+
 bool OS::sendSignalToThread(int thread_id, int signo) {
 #ifdef __aarch64__
     register long x0 asm("x0") = thread_id;
@@ -396,23 +404,28 @@ int OS::createMemoryFile(const char* name) {
     return -1;
 }
 
-void OS::copyFile(int src_fd, int dst_fd, off_t offset, size_t size) {
+bool OS::copyFile(int src_fd, int dst_fd, off_t offset, size_t size) {
     size_t map_size = size + offset;
     char* buf = (char*)mmap(NULL, map_size, PROT_READ, MAP_PRIVATE, src_fd, 0);
     if (buf == MAP_FAILED) {
-        return;
+        return false;
     }
 
     while (size > 0) {
         ssize_t bytes = write(dst_fd, buf + offset, size < 262144 ? size : 262144);
+        if (bytes < 0 && errno == EINTR) {
+            continue;
+        }
         if (bytes <= 0) {
-            break;
+            munmap(buf, map_size);
+            return false;
         }
         offset += (size_t)bytes;
         size -= (size_t)bytes;
     }
 
     munmap(buf, map_size);
+    return true;
 }
 
 void OS::freePageCache(int fd, off_t start_offset) {

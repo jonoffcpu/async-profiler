@@ -87,6 +87,11 @@ static const char USAGE_STRING[] =
     "  --sched             group threads by scheduling policy\n"
     "  --cstack mode       how to traverse C stack: fp|dwarf|vm|no\n"
     "  --signal num        use alternative signal for cpu or wall clock profiling\n"
+    "  --signalcookie      capture queued external signal cookies into JFR\n"
+    "  --signalcookie=mode delivery mode: queued (default) or coalescing\n"
+    "  --cookiesignal num  signal within the selected mode's pool (default: auto)\n"
+    "  --signalid uuid     canonical session UUID for signal cookie capture\n"
+    "  --signalepoch num   expected epoch for an identity-guarded stop\n"
     "  --clock source      clock source for JFR timestamps: tsc|monotonic\n"
     "  --begin function    begin profiling when function is executed\n"
     "  --end function      end profiling when function is executed\n"
@@ -517,6 +522,18 @@ int main(int argc, const char** argv) {
         } else if (arg == "--all" || arg == "--live" || arg == "--nobatch" || arg == "--nofree" || arg == "--nostop" ||
                    arg == "--record-cpu" || arg == "--sched" || arg == "--tlab" || arg == "--ttsp") {
             params << "," << (arg.str() + 2);
+
+        } else if (arg == "--signalcookie") {
+            params << ",signalcookie";
+
+        } else if (strncmp(arg.str(), "--signalcookie=", 15) == 0) {
+            params << ",signalcookie=" << (arg.str() + 15);
+
+        } else if (arg == "--cookiesignal") {
+            params << ",cookiesignal=" << args.next();
+
+        } else if (arg == "--signalid" || arg == "--signalepoch") {
+            params << "," << (arg.str() + 2) << "=" << args.next();
 
         } else if (arg == "--all-user") {
             params << ",alluser";

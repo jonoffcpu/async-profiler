@@ -93,6 +93,7 @@ static inline int hasNativeStack(EventType event_type) {
     const int events_with_native_stack =
         (1 << PERF_SAMPLE)        |
         (1 << EXECUTION_SAMPLE)   |
+        (1 << SIGNAL_SAMPLE)      |
         (1 << WALL_CLOCK_SAMPLE)  |
         (1 << NATIVE_LOCK_SAMPLE) |
         (1 << MALLOC_SAMPLE)      |
@@ -792,7 +793,7 @@ Engine* Profiler::selectEngine(Arguments& args) {
     } else if (strcmp(event_name, EVENT_ITIMER) == 0) {
         return &itimer;
     } else if (strcmp(event_name, EVENT_SIGNAL) == 0) {
-        return &signal_event;
+        return args._signal_cookie ? &noop_engine : &signal_event;
     } else if (strchr(event_name, '.') != NULL && strchr(event_name, ':') == NULL) {
         return &instrument;
     } else {
@@ -887,7 +888,7 @@ Error Profiler::start(Arguments& args, bool reset) {
 
     _event_mask = args.eventMask();
 
-    if (_event_mask == 0) {
+    if (_event_mask == 0 && !args._signal_cookie) {
         return Error("No profiling events specified");
     } else if ((_event_mask & (_event_mask - 1)) && args._output != OUTPUT_JFR) {
         return Error("Only JFR output supports multiple events");
@@ -897,6 +898,20 @@ Error Profiler::start(Arguments& args, bool reset) {
 
     if (args._jfr_sync && !VM::loaded()) {
         return Error("jfrsync is not supported with non-Java processes");
+    }
+
+    error = SignalEvent::validateCookieArguments(args);
+    if (error) {
+        return error;
+    }
+
+    int cookie_signal = OS::cookieSignal();
+    if (cookie_signal != 0) {
+        for (int signals = args._signal; signals > 0; signals >>= 8) {
+            if ((signals & 0xff) == cookie_signal) {
+                return Error("Profiling signal collides with the reserved signalcookie signal");
+            }
+        }
     }
 
     if (args._fdtransfer) {
@@ -912,9 +927,6 @@ Error Profiler::start(Arguments& args, bool reset) {
             return Error("Process sampling requires JFR output format");
         }
     }
-
-    // Save the arguments for shutdown or restart
-    args.save();
 
     if (reset || _start_time == 0) {
         // Reset counters
@@ -1002,8 +1014,24 @@ Error Profiler::start(Arguments& args, bool reset) {
     // Kernel symbols are useful only for perf_events without --all-user
     updateSymbols(_engine == &perf_events && !args._alluser);
 
+    // Burn and publish the identity before any JFR file or JVM master recording
+    // is created. The handler remains closed until every recording component is
+    // ready, so queued stale signals cannot enter a partially started capture.
+    if (args._signal_cookie) {
+        error = SignalEvent::reserveCookieCapture(args);
+        if (error) {
+            FdTransferClient::closePeer();
+            return error;
+        }
+    }
+
+    // Save only after the reserved signal and epoch are known so every JFR chunk
+    // carries the same capture identity that was returned to the controller.
+    args.save();
+
     error = installTraps(args._begin, args._end, args._nostop);
     if (error) {
+        if (args._signal_cookie) SignalEvent::abortCookieCapture();
         return error;
     }
     switchLibcHooks(true);
@@ -1013,6 +1041,7 @@ Error Profiler::start(Arguments& args, bool reset) {
         if (error) {
             uninstallTraps();
             switchLibcHooks(false);
+            if (args._signal_cookie) SignalEvent::abortCookieCapture();
             return error;
         }
     }
@@ -1074,6 +1103,10 @@ Error Profiler::start(Arguments& args, bool reset) {
         startTimer();
     }
 
+    if (args._signal_cookie) {
+        SignalEvent::publishCookieCapture();
+    }
+
     return Error::OK;
 
 error7:
@@ -1102,14 +1135,24 @@ error1:
     _jfr.stop();
     unlockAll();
 
+    if (args._signal_cookie) SignalEvent::abortCookieCapture();
+
     FdTransferClient::closePeer();
     return error;
 }
 
-Error Profiler::stop(bool restart) {
+Error Profiler::stop(bool restart, const char* reason) {
     MutexLocker ml(_state_lock);
     if (_state != RUNNING) {
         return Error("Profiler is not active");
+    }
+    if (_global_args._signal_cookie && reason == NULL) {
+        return Error("active signalcookie capture requires identity-guarded stop");
+    }
+
+    bool cookie_capture = _global_args._signal_cookie;
+    if (cookie_capture) {
+        SignalEvent::stopCookieCapture();
     }
 
     uninstallTraps();
@@ -1134,17 +1177,29 @@ Error Profiler::stop(bool restart) {
     // Log before stopping JFR to include stats in the recording
     logStats();
 
-    // Acquire all spinlocks to avoid race with remaining signals
+    // Acquire all spinlocks to exclude remaining signals and public user/span
+    // event writers, which can still use the recording after the engine stops.
     lockAll();
-    _jfr.stop();
+
+    // Cookie counters are stable after the signal engine closes and drains its
+    // admission gate. Serialize stats under the buffer locks before JFR teardown.
+    if (cookie_capture) {
+        SignalEvent::recordCaptureStats();
+    }
+
+    bool finalized = _jfr.stop();
     unlockAll();
+
+    if (cookie_capture) {
+        SignalEvent::finishCookieCapture(finalized, finalized ? reason : "finalization-failed");
+    }
 
     if (!restart) {
         FdTransferClient::closePeer();
     }
 
     _state = IDLE;
-    return Error::OK;
+    return finalized ? Error::OK : Error("Failed to finalize JFR recording");
 }
 
 Error Profiler::flushJfr() {
@@ -1173,6 +1228,9 @@ Error Profiler::dump(Writer& out, Arguments& args) {
     }
 
     if (_state == RUNNING) {
+        if (_global_args._signal_cookie && args._output != OUTPUT_JFR) {
+            return Error("live aggregate dumps are not supported during signalcookie capture");
+        }
         updateJavaThreadNames();
         updateNativeThreadNames();
         if (hasEvent(EC_WALL)) wall_clock.flush();
@@ -1573,20 +1631,69 @@ void Profiler::logEmptyOutput(Arguments& args, u64 printed_samples_count, Writer
 }
 
 Error Profiler::runInternal(Arguments& args, Writer& out) {
+    if (!args._signal_cookie && (args._signal_id != NULL || args._signal_epoch != 0)) {
+        return Error("signalid and signalepoch require signalcookie");
+    }
+
     switch (args._action) {
         case ACTION_START:
         case ACTION_RESUME: {
-            Error error = start(args, args._action == ACTION_START);
-            if (error) {
-                return error;
+            BufferWriter response;
+            {
+                // Keep the returned capture identity bound to this start even if a
+                // different controller concurrently stops or starts a recording.
+                MutexLocker ml(_state_lock);
+                Error error = start(args, args._action == ACTION_START);
+                if (error) {
+                    return error;
+                }
+                if (args._signal_cookie) {
+                    SignalEvent::writeCaptureStatus(response);
+                } else if (!args._quiet) {
+                    response << "Profiling started\n";
+                }
             }
-            if (!args._quiet) {
-                out << "Profiling started\n";
-            }
+            out.write(response.buf(), response.size());
             break;
         }
         case ACTION_STOP: {
-            Error error = stop();
+            if (args._signal_cookie) {
+                if (args._signal_id == NULL) {
+                    return Error("guarded signalcookie stop requires signalid");
+                }
+                BufferWriter response;
+                {
+                    MutexLocker ml(_state_lock);
+                    SignalCookieLookup lookup = SignalEvent::lookupCapture(args._signal_id, args._signal_epoch);
+                    if (lookup == SIGNAL_COOKIE_ACTIVE) {
+                        if (_state != RUNNING) {
+                            response << "signal-capture-v1 inactive\n";
+                        } else {
+                            Error error = stop(false, "guarded-stop");
+                            if (error) {
+                                return error;
+                            }
+                            SignalEvent::writeTerminalStatus(response);
+                        }
+                    } else if (lookup == SIGNAL_COOKIE_TERMINAL) {
+                        SignalEvent::writeTerminalStatus(response);
+                    } else if (lookup == SIGNAL_COOKIE_MISMATCH) {
+                        response << "signal-capture-v1 mismatch\n";
+                    } else {
+                        response << "signal-capture-v1 inactive\n";
+                    }
+                }
+                out.write(response.buf(), response.size());
+                break;
+            }
+            Error error = Error::OK;
+            {
+                MutexLocker ml(_state_lock);
+                if (SignalEvent::cookieCaptureReady()) {
+                    return Error("active signalcookie capture requires identity-guarded stop");
+                }
+                error = stop();
+            }
             if (args._output == OUTPUT_NONE) {
                 if (error) {
                     return error;
@@ -1606,12 +1713,38 @@ Error Profiler::runInternal(Arguments& args, Writer& out) {
             break;
         }
         case ACTION_STATUS: {
-            MutexLocker ml(_state_lock);
-            if (_state == RUNNING) {
-                out << "Profiling is running for " << uptime() << " seconds\n";
-            } else {
-                out << "Profiler is not active\n";
+            BufferWriter response;
+            {
+                MutexLocker ml(_state_lock);
+                if (args._signal_cookie) {
+                    if (args._signal_id != NULL) {
+                        if (args._signal_epoch == 0) {
+                            return Error("identity-specific signalcookie status requires signalepoch");
+                        }
+                        SignalCookieLookup lookup = SignalEvent::lookupCapture(args._signal_id, args._signal_epoch);
+                        if (lookup == SIGNAL_COOKIE_ACTIVE) {
+                            SignalEvent::writeCaptureStatus(response);
+                        } else if (lookup == SIGNAL_COOKIE_TERMINAL) {
+                            SignalEvent::writeTerminalStatus(response);
+                        } else if (lookup == SIGNAL_COOKIE_MISMATCH) {
+                            response << "signal-capture-v1 mismatch\n";
+                        } else {
+                            response << "signal-capture-v1 inactive\n";
+                        }
+                    } else if (SignalEvent::cookieCaptureReady()) {
+                        SignalEvent::writeCaptureStatus(response);
+                    } else if (_state == RUNNING) {
+                        response << "signal-capture-v1 busy mode=other\n";
+                    } else {
+                        response << "signal-capture-v1 inactive\n";
+                    }
+                } else if (_state == RUNNING) {
+                    response << "Profiling is running for " << uptime() << " seconds\n";
+                } else {
+                    response << "Profiler is not active\n";
+                }
             }
+            out.write(response.buf(), response.size());
             break;
         }
         case ACTION_METRICS: {
@@ -1682,7 +1815,7 @@ Error Profiler::expire(Arguments& args, bool restart) {
     {
         MutexLocker ml(_state_lock);
 
-        Error error = stop(restart);
+        Error error = stop(restart, restart ? "loop" : "timeout");
         if (error) {
             return error;
         }
@@ -1734,7 +1867,12 @@ void Profiler::shutdown(Arguments& args) {
     // The last chance to dump profile before VM terminates
     if (_state == RUNNING) {
         args._action = ACTION_STOP;
-        Error error = run(args);
+        Error error = Error::OK;
+        if (_global_args._signal_cookie) {
+            error = stop(false, "vm-shutdown");
+        } else {
+            error = run(args);
+        }
         if (error) {
             Log::error("%s", error.message());
         }

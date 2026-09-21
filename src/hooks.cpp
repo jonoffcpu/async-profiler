@@ -13,6 +13,7 @@
 #include "cpuEngine.h"
 #include "mallocTracer.h"
 #include "nativeLockTracer.h"
+#include "os.h"
 #include "profiler.h"
 #include "symbols.h"
 
@@ -45,6 +46,10 @@ static void unblock_signals() {
         for (int s = _global_args._signal; s > 0; s >>= 8) {
             sigaddset(&set, s & 0xff);
         }
+    }
+    int cookie_signal = OS::cookieSignal();
+    if (cookie_signal != 0) {
+        sigaddset(&set, cookie_signal);
     }
     pthread_sigmask(SIG_UNBLOCK, &set, NULL);
 }

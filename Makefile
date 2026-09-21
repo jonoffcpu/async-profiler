@@ -227,9 +227,9 @@ build/test/cpptests: $(CPP_TEST_SOURCES) $(CPP_TEST_HEADER) $(SOURCES) $(HEADERS
 	mkdir -p build/test
 ifeq ($(MERGE),true)
 	for f in src/*.cpp test/native/*.cpp; do echo '#include "'$$f'"'; done |\
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEFS) $(INCLUDES) $(CPP_TEST_INCLUDES) -fPIC -o $@ -xc++ - $(LIBS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEFS) -DASYNC_PROFILER_TEST $(INCLUDES) $(CPP_TEST_INCLUDES) -fPIC -o $@ -xc++ - $(LIBS)
 else
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEFS) $(INCLUDES) $(CPP_TEST_INCLUDES) -fPIC -o $@ $(SOURCES) $(CPP_TEST_SOURCES) $(LIBS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(DEFS) -DASYNC_PROFILER_TEST $(INCLUDES) $(CPP_TEST_INCLUDES) -fPIC -o $@ $(SOURCES) $(CPP_TEST_SOURCES) $(LIBS)
 endif
 
 build-test-java: all build/$(TEST_JAR) build/test/build-test-libs build/test/build-test-bins
@@ -246,6 +246,7 @@ build/test/build-test-libs: $(TEST_LIB_SOURCES)
 	$(CC) -shared -fPIC -o $(TEST_LIB_DIR)/libmalloc.$(SOEXT) test/native/libs/malloc.c
 	$(CC) -fno-optimize-sibling-calls -shared -fPIC $(INCLUDES) -Isrc -o $(TEST_LIB_DIR)/libjninativestacks.$(SOEXT) test/native/libs/jninativestacks.c
 	$(CC) -shared -fPIC $(INCLUDES) -Isrc -o $(TEST_LIB_DIR)/libjninativelocks.$(SOEXT) test/native/libs/jninativelocks.c -lpthread
+	$(CC) -shared -fPIC $(INCLUDES) -o $(TEST_LIB_DIR)/libsignaltraps.$(SOEXT) test/native/libs/signaltraps.c
 
 ifeq ($(OS_TAG),linux)
 	$(CC) -c -shared -fPIC -o $(TEST_LIB_DIR)/vaddrdif.o test/native/libs/vaddrdif.c
@@ -269,6 +270,7 @@ build/test/build-test-bins: $(TEST_BIN_SOURCES)
 	$(CC) -o $(TEST_BIN_DIR)/malloc_plt_dyn test/test/nativemem/malloc_plt_dyn.c
 	$(CC) -o $(TEST_BIN_DIR)/native_api -Isrc test/test/c/native_api.c -ldl
 	$(CC) -o $(TEST_BIN_DIR)/native_lock_contention test/test/nativelock/native_lock_contention.c -lpthread
+	$(CC) -o $(TEST_BIN_DIR)/signal_cookie test/test/signal/signal_cookie.c
 	$(CC) -o $(TEST_BIN_DIR)/profile_with_dlopen -Isrc test/test/nativemem/profile_with_dlopen.c -ldl
 	$(CC) -o $(TEST_BIN_DIR)/preload_malloc -Isrc test/test/nativemem/preload_malloc.c -ldl
 	$(CC) -o $(TEST_BIN_DIR)/nativemem_known_lib_crash -Isrc test/test/nativemem/nativemem_known_lib_crash.c -ldl

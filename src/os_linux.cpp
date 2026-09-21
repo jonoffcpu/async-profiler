@@ -98,7 +98,12 @@ JitWriteProtection::~JitWriteProtection() {
 }
 
 
-static SigAction installed_sigaction[64];
+static SigAction installed_sigaction[NSIG];
+static volatile int reserved_cookie_signal;
+static bool reserved_cookie_coalescing;
+#ifdef ASYNC_PROFILER_TEST
+static volatile bool fail_next_cookie_signal_install;
+#endif
 
 const size_t OS::page_size = sysconf(_SC_PAGESIZE);
 const size_t OS::page_mask = OS::page_size - 1;
@@ -344,10 +349,11 @@ int OS::getProfilingSignal(int mode) {
     int& signo = preferred_signals[mode];
     int initial_signo = signo;
     int other_signo = preferred_signals[1 - mode];
+    int cookie_signo = __atomic_load_n(&reserved_cookie_signal, __ATOMIC_ACQUIRE);
 
     do {
         struct sigaction sa;
-        if (signo != other_signo && sigaction(signo, NULL, &sa) == 0) {
+        if (signo != other_signo && signo != cookie_signo && sigaction(signo, NULL, &sa) == 0) {
             if (sa.sa_handler == SIG_DFL || sa.sa_handler == SIG_IGN || sa.sa_sigaction == installed_sigaction[signo]) {
                 return signo;
             }
@@ -356,6 +362,85 @@ int OS::getProfilingSignal(int mode) {
 
     return signo;
 }
+
+static bool cookieSignalAllowed(int signo, int primary_signals, bool coalescing) {
+    bool in_delivery_pool = coalescing
+        ? (signo == SIGSTKFLT || signo == SIGPWR)
+        : (signo >= SIGRTMIN && signo <= SIGRTMAX);
+    if (!in_delivery_pool || signo <= 0 || signo >= NSIG) {
+        return false;
+    }
+    for (int value = primary_signals; value > 0; value >>= 8) {
+        if ((value & 0xff) == signo) return false;
+    }
+    return true;
+}
+
+int OS::reserveCookieSignal(int requested, int primary_signals, bool coalescing, SigAction action) {
+    int reserved = __atomic_load_n(&reserved_cookie_signal, __ATOMIC_ACQUIRE);
+    if (reserved != 0) {
+        if (coalescing != reserved_cookie_coalescing ||
+                (requested != 0 && requested != reserved) ||
+                !cookieSignalAllowed(reserved, primary_signals, coalescing)) {
+            errno = EBUSY;
+            return 0;
+        }
+        struct sigaction current;
+        if (sigaction(reserved, NULL, &current) != 0 ||
+                (current.sa_flags & SA_SIGINFO) == 0 || current.sa_sigaction != action) {
+            errno = EBUSY;
+            return 0;
+        }
+        return reserved;
+    }
+
+    int candidates[] = {SIGSTKFLT, SIGPWR};
+    int first = requested != 0 ? requested : (coalescing ? 0 : SIGRTMIN);
+    int last = requested != 0 ? requested : (coalescing ? 1 : SIGRTMAX);
+    for (int value = first; value <= last; value++) {
+        int signo = requested != 0 || !coalescing ? value : candidates[value];
+        if (!cookieSignalAllowed(signo, primary_signals, coalescing)) continue;
+
+        struct sigaction current;
+        if (sigaction(signo, NULL, &current) != 0 || current.sa_handler != SIG_DFL) continue;
+
+        struct sigaction replacement;
+        memset(&replacement, 0, sizeof(replacement));
+        sigemptyset(&replacement.sa_mask);
+        replacement.sa_sigaction = action;
+        replacement.sa_flags = SA_SIGINFO | SA_RESTART;
+
+        struct sigaction previous;
+#ifdef ASYNC_PROFILER_TEST
+        if (__atomic_exchange_n(&fail_next_cookie_signal_install, false, __ATOMIC_ACQ_REL)) {
+            errno = EIO;
+            continue;
+        }
+#endif
+        if (sigaction(signo, &replacement, &previous) != 0) continue;
+        if (previous.sa_handler != SIG_DFL) {
+            sigaction(signo, &previous, NULL);
+            continue;
+        }
+        installed_sigaction[signo] = action;
+        reserved_cookie_coalescing = coalescing;
+        __atomic_store_n(&reserved_cookie_signal, signo, __ATOMIC_RELEASE);
+        return signo;
+    }
+
+    errno = EBUSY;
+    return 0;
+}
+
+int OS::cookieSignal() {
+    return __atomic_load_n(&reserved_cookie_signal, __ATOMIC_ACQUIRE);
+}
+
+#ifdef ASYNC_PROFILER_TEST
+void OS::failNextCookieSignalInstallForTest() {
+    __atomic_store_n(&fail_next_cookie_signal_install, true, __ATOMIC_RELEASE);
+}
+#endif
 
 bool OS::sendSignalToThread(int thread_id, int signo) {
     return syscall(__NR_tgkill, processId(), thread_id, signo) == 0;
@@ -434,15 +519,19 @@ int OS::createMemoryFile(const char* name) {
     return syscall(__NR_memfd_create, name, 0);
 }
 
-void OS::copyFile(int src_fd, int dst_fd, off_t offset, size_t size) {
+bool OS::copyFile(int src_fd, int dst_fd, off_t offset, size_t size) {
     // copy_file_range() is probably better, but not supported on all kernels
     while (size > 0) {
         ssize_t bytes = sendfile(dst_fd, src_fd, &offset, size);
+        if (bytes < 0 && errno == EINTR) {
+            continue;
+        }
         if (bytes <= 0) {
-            break;
+            return false;
         }
         size -= (size_t)bytes;
     }
+    return true;
 }
 
 void OS::freePageCache(int fd, off_t start_offset) {

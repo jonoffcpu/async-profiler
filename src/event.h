@@ -15,6 +15,7 @@
 enum EventType {
     PERF_SAMPLE,
     EXECUTION_SAMPLE,
+    SIGNAL_SAMPLE,
     WALL_CLOCK_SAMPLE,
     NATIVE_LOCK_SAMPLE,
     MALLOC_SAMPLE,
@@ -49,6 +50,29 @@ class ExecutionEvent : public Event {
         _start_time = start_time;
         _thread_state = THREAD_UNKNOWN;
     }
+};
+
+class SignalSampleEvent : public Event {
+  public:
+    u64 _correlation_id;
+    u64 _monotonic_time_nanos;
+
+    SignalSampleEvent(u64 start_time, u64 correlation_id, u64 monotonic_time_nanos) {
+        _start_time = start_time;
+        _correlation_id = correlation_id;
+        _monotonic_time_nanos = monotonic_time_nanos;
+    }
+};
+
+struct SignalCaptureStats {
+    u64 admitted_signals;
+    u64 invalid_signal_code;
+    u64 zero_cookie;
+    u64 zero_sequence;
+    u64 stale_epoch;
+    u64 accepted_cookies;
+    u64 capture_failures;
+    u64 submitted_samples;
 };
 
 class MethodTraceEvent : public Event {

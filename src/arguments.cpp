@@ -256,6 +256,50 @@ Error Arguments::parse(const char* args) {
                     _signal |= atoi(value + 1) << 8;
                 }
 
+            CASE("signalcookie")
+                if (value == NULL || strcmp(value, "queued") == 0) {
+                    _signal_cookie_delivery = SIGNAL_COOKIE_QUEUED;
+                } else if (strcmp(value, "coalescing") == 0) {
+                    _signal_cookie_delivery = SIGNAL_COOKIE_COALESCING;
+                } else {
+                    msg = "signalcookie must be queued or coalescing";
+                }
+                _signal_cookie = true;
+
+            CASE("cookiesignal")
+                if (value == NULL || value[0] == 0) {
+                    msg = "cookiesignal must not be empty";
+                } else if (strcmp(value, "auto") == 0) {
+                    _cookie_signal = 0;
+                } else {
+                    char* end;
+                    long signal = strtol(value, &end, 10);
+                    if (*end != 0 || signal <= 0 || signal > 255) {
+                        msg = "cookiesignal must be a positive signal number";
+                    } else {
+                        _cookie_signal = (int)signal;
+                    }
+                }
+
+            CASE("signalid")
+                if (value == NULL || value[0] == 0) {
+                    msg = "signalid must not be empty";
+                }
+                _signal_id = value;
+
+            CASE("signalepoch")
+                if (value == NULL || value[0] == 0) {
+                    msg = "signalepoch must not be empty";
+                } else {
+                    char* end;
+                    unsigned long long epoch = strtoull(value, &end, 10);
+                    if (*end != 0 || epoch == 0 || epoch > UINT32_MAX) {
+                        msg = "signalepoch must be an unsigned 32-bit value";
+                    } else {
+                        _signal_epoch = epoch;
+                    }
+                }
+
             CASE("features")
                 if (value != NULL) {
                     if (strstr(value, "stats"))    _features.stats = 1;

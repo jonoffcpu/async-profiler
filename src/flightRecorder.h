@@ -18,7 +18,7 @@ class FlightRecorder {
     Recording* _rec;
 
     Error startMasterRecording(Arguments& args, const char* filename);
-    void stopMasterRecording();
+    bool stopMasterRecording();
 
   public:
     static const LogLevel MIN_LOG_LEVEL = LogLevel::LOG_DEBUG;
@@ -27,7 +27,7 @@ class FlightRecorder {
     }
 
     Error start(Arguments& args, bool reset);
-    void stop();
+    bool stop();
     void flush();
     size_t usedMemory();
     bool timerTick(u64 wall_time, u32 gc_id);
@@ -38,6 +38,8 @@ class FlightRecorder {
 
     void recordEvent(int lock_index, int tid, u32 call_trace_id,
                      EventType event_type, Event* event);
+    void recordSignalCaptureStats(const char* session_id, u32 capture_epoch,
+                                  const SignalCaptureStats& stats);
 
     void recordLog(LogLevel level, const char* message, size_t len);
 

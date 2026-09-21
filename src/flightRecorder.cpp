@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
@@ -36,7 +37,7 @@
 INCLUDE_HELPER_CLASS(JFR_SYNC_NAME, JFR_SYNC_CLASS, "one/profiler/JfrSync")
 
 static void JNICALL JfrSync_stopProfiler(JNIEnv* env, jclass cls) {
-    Profiler::instance()->stop();
+    Profiler::instance()->stop(false, "master-stop");
 }
 
 
@@ -271,21 +272,45 @@ class Recording {
     SmallBuffer _monitor_buf;
     RecordingBuffer _proc_buf;
     ProcessSampler _process_sampler;
+    bool _signal_capture;
+    char* _signal_session_id;
+    u32 _signal_capture_epoch;
+    int _signal_number;
+    const char* _signal_delivery;
+    bool _io_error;
+    bool _finished;
 
     static float ratio(float value) {
         return value < 0 ? 0 : value > 1 ? 1 : value;
     }
 
+    void setIoError() {
+        __atomic_store_n(&_io_error, true, __ATOMIC_RELAXED);
+    }
+
+    bool hasIoError() const {
+        return __atomic_load_n(&_io_error, __ATOMIC_RELAXED);
+    }
+
   public:
     Recording(int fd, const char* master_recording_file, Arguments& args) : _fd(fd) {
+        _io_error = false;
+        _finished = false;
         _master_recording_file = master_recording_file == NULL ? NULL : strdup(master_recording_file);
         _chunk_start = lseek(_fd, 0, SEEK_END);
+        if (_chunk_start < 0) setIoError();
         _start_time = OS::micros();
         _start_ticks = TSC::ticks();
         _base_id = 0;
         _bytes_written = 0;
         _memfd = -1;
         _in_memory = false;
+        _signal_capture = args._signal_cookie;
+        _signal_session_id = _signal_capture ? strdup(args._signal_id) : NULL;
+        _signal_capture_epoch = (u32)args._signal_epoch;
+        _signal_number = _signal_capture ? args._cookie_signal : 0;
+        _signal_delivery = args._signal_cookie_delivery == SIGNAL_COOKIE_COALESCING
+            ? "coalescing" : "queued";
 
         _chunk_size = args._chunk_size <= 0 ? MAX_JLONG : (args._chunk_size < 262144 ? 262144 : args._chunk_size);
         _chunk_time = args._chunk_time <= 0 ? MAX_JLONG : (args._chunk_time < 5 ? 5 : args._chunk_time) * 1000000ULL;
@@ -295,6 +320,7 @@ class Recording {
         writeHeader(_buf);
         writeMetadata(_buf);
         writeRecordingInfo(_buf);
+        writeSignalCaptureContext(_buf);
         writeSettings(_buf, args);
         if (!args.hasOption(NO_SYSTEM_INFO)) {
             writeOsCpuInfo(_buf);
@@ -330,18 +356,36 @@ class Recording {
     }
 
     ~Recording() {
+        finish();
+        free(_signal_session_id);
+    }
+
+    bool finish() {
+        if (_finished) return !hasIoError();
+        _finished = true;
+
         off_t chunk_end = finishChunk();
 
         if (_memfd >= 0) {
-            close(_memfd);
+            if (close(_memfd) != 0) setIoError();
+            _memfd = -1;
         }
 
         if (_master_recording_file != NULL) {
-            appendRecording(_master_recording_file, chunk_end);
+            if (chunk_end < 0 || !appendRecording(_master_recording_file, chunk_end)) setIoError();
             free(_master_recording_file);
+            _master_recording_file = NULL;
+        } else if (_fd >= 0 && fsync(_fd) != 0) {
+            setIoError();
         }
 
-        close(_fd);
+        if (_fd >= 0 && close(_fd) != 0) setIoError();
+        _fd = -1;
+        return !hasIoError();
+    }
+
+    bool good() const {
+        return !hasIoError();
     }
 
     off_t finishChunk() {
@@ -358,20 +402,22 @@ class Recording {
         _stop_ticks = TSC::ticks();
 
         if (_memfd >= 0) {
-            OS::copyFile(_memfd, _fd, 0, lseek(_memfd, 0, SEEK_CUR));
+            off_t memory_size = lseek(_memfd, 0, SEEK_CUR);
+            if (memory_size < 0 || !OS::copyFile(_memfd, _fd, 0, memory_size)) setIoError();
             _in_memory = false;
         }
 
         off_t cpool_offset = lseek(_fd, 0, SEEK_CUR);
+        if (cpool_offset < 0) setIoError();
         writeCpool(_buf);
         flush(_buf);
 
         off_t chunk_end = lseek(_fd, 0, SEEK_CUR);
+        if (chunk_end < 0) setIoError();
 
         // Patch cpool size field
         _buf->putVar32(0, chunk_end - cpool_offset);
-        ssize_t result = pwrite(_fd, _buf->data(), 5, cpool_offset);
-        (void)result;
+        if (!pwriteAll(_buf->data(), 5, cpool_offset)) setIoError();
 
         // Workaround for JDK-8191415: compute actual TSC frequency, in case JFR is wrong
         u64 tsc_frequency;
@@ -390,8 +436,7 @@ class Recording {
         _buf->put64((_stop_time - _start_time) * 1000);
         _buf->put64(_start_ticks);
         _buf->put64(tsc_frequency);
-        result = pwrite(_fd, _buf->data(), 56, _chunk_start + 8);
-        (void)result;
+        if (!pwriteAll(_buf->data(), 56, _chunk_start + 8)) setIoError();
 
         OS::freePageCache(_fd, _chunk_start);
 
@@ -409,6 +454,7 @@ class Recording {
         writeHeader(_buf);
         writeMetadata(_buf);
         writeRecordingInfo(_buf);
+        writeSignalCaptureContext(_buf);
         flush(_buf);
 
         if (_memfd >= 0) {
@@ -489,14 +535,17 @@ class Recording {
         return _master_recording_file != NULL;
     }
 
-    void appendRecording(const char* target_file, size_t size) {
+    bool appendRecording(const char* target_file, size_t size) {
         int append_fd = open(target_file, O_WRONLY);
         if (append_fd >= 0) {
-            lseek(append_fd, 0, SEEK_END);
-            OS::copyFile(_fd, append_fd, 0, size);
-            close(append_fd);
+            bool result = lseek(append_fd, 0, SEEK_END) >= 0 &&
+                          OS::copyFile(_fd, append_fd, 0, size) &&
+                          fsync(append_fd) == 0;
+            if (close(append_fd) != 0) result = false;
+            return result;
         } else {
             Log::warn("Failed to open JFR recording at %s: %s", target_file, strerror(errno));
+            return false;
         }
     }
 
@@ -565,10 +614,35 @@ class Recording {
         return chars > 0 ? str + 1 : "";
     }
 
+    bool pwriteAll(const char* data, size_t size, off_t offset) {
+        while (size > 0) {
+            ssize_t result = pwrite(_fd, data, size, offset);
+            if (result < 0 && errno == EINTR) continue;
+            if (result <= 0) return false;
+            data += result;
+            size -= (size_t)result;
+            offset += result;
+        }
+        return true;
+    }
+
     void flush(Buffer* buf) {
-        ssize_t result = write(_in_memory ? _memfd : _fd, buf->data(), buf->offset());
-        if (result > 0) {
-            atomicInc(_bytes_written, (u64)result);
+        int fd = _in_memory ? _memfd : _fd;
+        const char* data = buf->data();
+        size_t remaining = buf->offset();
+        size_t written = 0;
+        while (remaining > 0) {
+            ssize_t result = write(fd, data + written, remaining);
+            if (result < 0 && errno == EINTR) continue;
+            if (result <= 0) {
+                setIoError();
+                break;
+            }
+            written += (size_t)result;
+            remaining -= (size_t)result;
+        }
+        if (written > 0) {
+            atomicInc(_bytes_written, (u64)written);
         }
         buf->reset();
     }
@@ -642,6 +716,23 @@ class Recording {
         buf->put8(start, buf->offset() - start);
     }
 
+    void writeSignalCaptureContext(Buffer* buf) {
+        if (!_signal_capture) return;
+
+        int start = buf->skip(5);
+        buf->put8(T_SIGNAL_CAPTURE);
+        buf->putVar64(_start_ticks);
+        buf->putVar32(1);
+        buf->putUtf8(_signal_session_id);
+        buf->putVar64(_signal_capture_epoch);
+        buf->putVar32(_signal_number);
+        buf->putUtf8(_signal_delivery);
+        buf->putVar64(OS::processId());
+        // Informational AP process timestamp. It is not a kernel task-generation proof.
+        buf->putVar64(OS::processStartTime());
+        buf->putVar32(start, buf->offset() - start);
+    }
+
     void writeSettings(Buffer* buf, Arguments& args) {
         assert(args._cstack < sizeof(SETTING_CSTACK) / sizeof(char*));
         writeStringSetting(buf, T_ACTIVE_RECORDING, "version", PROFILER_VERSION);
@@ -669,8 +760,10 @@ class Recording {
         char str[256];
         writeStringSetting(buf, T_ACTIVE_RECORDING, "features", getFeaturesString(str, sizeof(str), args._features));
 
-        writeBoolSetting(buf, T_EXECUTION_SAMPLE, "enabled", args._event != NULL);
-        if (args._event != NULL) {
+        bool execution_samples = (args.eventMask() & (1 << EC_CPU)) != 0;
+        writeBoolSetting(buf, T_EXECUTION_SAMPLE, "enabled", execution_samples);
+        writeBoolSetting(buf, T_SIGNAL_SAMPLE, "enabled", args._signal_cookie);
+        if (execution_samples) {
             writeIntSetting(buf, T_EXECUTION_SAMPLE, "interval", args._interval);
             writeBoolSetting(buf, T_EXECUTION_SAMPLE, "alluser", args._alluser);
         }
@@ -1085,6 +1178,36 @@ class Recording {
         buf->put8(start, buf->offset() - start);
     }
 
+    void recordSignalSample(Buffer* buf, int tid, u32 call_trace_id, SignalSampleEvent* event) {
+        int start = buf->skip(1);
+        buf->put8(T_SIGNAL_SAMPLE);
+        buf->putVar64(event->_start_time);
+        buf->putVar32(tid);
+        buf->putVar32(call_trace_id);
+        buf->putVar64(event->_correlation_id);
+        buf->putVar64(event->_monotonic_time_nanos);
+        buf->put8(start, buf->offset() - start);
+    }
+
+    void recordSignalCaptureStats(Buffer* buf, const char* session_id, u32 capture_epoch,
+                                  const SignalCaptureStats& stats) {
+        int start = buf->skip(5);
+        buf->putVar32(T_SIGNAL_CAPTURE_STATS);
+        buf->putVar64(TSC::ticks());
+        buf->putVar32(1);
+        buf->putUtf8(session_id);
+        buf->putVar64(capture_epoch);
+        buf->putVar64(stats.admitted_signals);
+        buf->putVar64(stats.invalid_signal_code);
+        buf->putVar64(stats.zero_cookie);
+        buf->putVar64(stats.zero_sequence);
+        buf->putVar64(stats.stale_epoch);
+        buf->putVar64(stats.accepted_cookies);
+        buf->putVar64(stats.capture_failures);
+        buf->putVar64(stats.submitted_samples);
+        buf->putVar32(start, buf->offset() - start);
+    }
+
     void recordMethodTrace(Buffer* buf, int tid, u32 call_trace_id, MethodTraceEvent* event) {
         int start = buf->skip(1);
         buf->put8(T_METHOD_TRACE);
@@ -1336,6 +1459,7 @@ Error FlightRecorder::start(Arguments& args, bool reset) {
     int fd = open(filename, O_CREAT | O_RDWR | (reset ? O_TRUNC : 0), 0644);
     if (fd == -1) {
         free(filename_tmp);
+        if (master_recording_file != NULL) stopMasterRecording();
         return Error("Could not open Flight Recorder output file");
     }
 
@@ -1348,11 +1472,21 @@ Error FlightRecorder::start(Arguments& args, bool reset) {
     RecordingAPI::start();
 
     _rec = new Recording(fd, master_recording_file, args);
+    if (!_rec->good()) {
+        RecordingAPI::stop();
+        RateLimit::disable();
+        if (_rec->hasMasterRecording()) stopMasterRecording();
+        _rec->finish();
+        delete _rec;
+        _rec = NULL;
+        return Error("Could not initialize Flight Recorder output file");
+    }
     _rec_lock.unlock();
     return Error::OK;
 }
 
-void FlightRecorder::stop() {
+bool FlightRecorder::stop() {
+    bool finalized = true;
     if (_rec != NULL) {
         _rec_lock.lock();
 
@@ -1360,12 +1494,14 @@ void FlightRecorder::stop() {
         RateLimit::disable();
 
         if (_rec->hasMasterRecording()) {
-            stopMasterRecording();
+            finalized = stopMasterRecording();
         }
 
+        finalized = _rec->finish() && finalized;
         delete _rec;
         _rec = NULL;
     }
+    return finalized;
 }
 
 void FlightRecorder::flush() {
@@ -1465,12 +1601,17 @@ Error FlightRecorder::startMasterRecording(Arguments& args, const char* filename
     return Error::OK;
 }
 
-void FlightRecorder::stopMasterRecording() {
+bool FlightRecorder::stopMasterRecording() {
     JNIEnv* env = VM::jni();
-    if (env->CallStaticBooleanMethod(_jfr_sync_class, _stop_method) == JNI_FALSE) {
+    bool stopped = env->CallStaticBooleanMethod(_jfr_sync_class, _stop_method) != JNI_FALSE;
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        stopped = false;
+    } else if (!stopped) {
         Log::warn("Failed to stop JFR recording");
     }
     env->ExceptionClear();
+    return stopped;
 }
 
 void FlightRecorder::recordEvent(int lock_index, int tid, u32 call_trace_id,
@@ -1490,6 +1631,9 @@ void FlightRecorder::recordEvent(int lock_index, int tid, u32 call_trace_id,
             case EXECUTION_SAMPLE:
             case INSTRUMENTED_METHOD:
                 _rec->recordExecutionSample(buf, tid, call_trace_id, (ExecutionEvent*)event);
+                break;
+            case SIGNAL_SAMPLE:
+                _rec->recordSignalSample(buf, tid, call_trace_id, (SignalSampleEvent*)event);
                 break;
             case METHOD_TRACE:
                 _rec->recordMethodTrace(buf, tid, call_trace_id, (MethodTraceEvent*)event);
@@ -1532,6 +1676,15 @@ void FlightRecorder::recordEvent(int lock_index, int tid, u32 call_trace_id,
         }
         _rec->flushIfNeeded(buf);
         _rec->addThread(tid);
+    }
+}
+
+void FlightRecorder::recordSignalCaptureStats(const char* session_id, u32 capture_epoch,
+                                              const SignalCaptureStats& stats) {
+    if (_rec != NULL) {
+        Buffer* buf = _rec->buffer(0);
+        _rec->recordSignalCaptureStats(buf, session_id, capture_epoch, stats);
+        _rec->flushIfNeeded(buf);
     }
 }
 

@@ -69,6 +69,9 @@ enum JfrType {
     T_SPAN = 123,
     T_USER_EVENT = 124,
     T_PROCESS_SAMPLE = 125,
+    T_SIGNAL_SAMPLE = 126,
+    T_SIGNAL_CAPTURE = 127,
+    T_SIGNAL_CAPTURE_STATS = 128,
 
     // types after T_ANNOTATION inherit from java.lang.annotation.Annotation, see JfrMetadata::type
     T_ANNOTATION = 200,

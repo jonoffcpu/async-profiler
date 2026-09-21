@@ -201,7 +201,7 @@ class Profiler {
     Error expire(Arguments& args, bool restart);
     void shutdown(Arguments& args);
     Error start(Arguments& args, bool reset);
-    Error stop(bool restart = false);
+    Error stop(bool restart = false, const char* reason = NULL);
     Error flushJfr();
     Error dump(Writer& out, Arguments& args);
     void logStats();

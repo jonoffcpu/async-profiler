@@ -7,6 +7,7 @@
 #define _ARGUMENTS_H
 
 #include <stddef.h>
+#include <string.h>
 #include <vector>
 
 
@@ -43,6 +44,11 @@ enum SHORT_ENUM Action {
 enum SHORT_ENUM Counter {
     COUNTER_SAMPLES,
     COUNTER_TOTAL
+};
+
+enum SHORT_ENUM SignalCookieDelivery {
+    SIGNAL_COOKIE_QUEUED,
+    SIGNAL_COOKIE_COALESCING
 };
 
 enum Style {
@@ -179,6 +185,11 @@ class Arguments {
     int _jstackdepth;
     int _truncated_stack_depth;
     int _signal;
+    bool _signal_cookie;
+    SignalCookieDelivery _signal_cookie_delivery;
+    int _cookie_signal;
+    const char* _signal_id;
+    unsigned long long _signal_epoch;
     const char* _file;
     const char* _log;
     const char* _loglevel;
@@ -243,6 +254,11 @@ class Arguments {
         _jstackdepth(DEFAULT_JSTACKDEPTH),
         _truncated_stack_depth(DEFAULT_JSTACKDEPTH),
         _signal(0),
+        _signal_cookie(false),
+        _signal_cookie_delivery(SIGNAL_COOKIE_QUEUED),
+        _cookie_signal(0),
+        _signal_id(NULL),
+        _signal_epoch(0),
         _file(NULL),
         _log(NULL),
         _loglevel(NULL),
@@ -307,7 +323,8 @@ class Arguments {
     }
 
     int eventMask() const {
-        return (_event      != NULL ? 1 << EC_CPU        : 0) |
+        bool cookie_only = _signal_cookie && _event != NULL && strcmp(_event, EVENT_SIGNAL) == 0;
+        return (_event != NULL && !cookie_only ? 1 << EC_CPU : 0) |
                (_alloc      >= 0    ? 1 << EC_ALLOC      : 0) |
                (_lock       >= 0    ? 1 << EC_LOCK       : 0) |
                (_wall       >= 0    ? 1 << EC_WALL       : 0) |

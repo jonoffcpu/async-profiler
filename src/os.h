@@ -124,6 +124,11 @@ class OS {
     static SigAction installSignalHandler(int signo, SigAction action, SigHandler handler = NULL);
     static SigAction replaceCrashHandler(SigAction action);
     static int getProfilingSignal(int mode);
+    static int reserveCookieSignal(int requested, int primary_signals, bool coalescing, SigAction action);
+    static int cookieSignal();
+#ifdef ASYNC_PROFILER_TEST
+    static void failNextCookieSignalInstallForTest();
+#endif
     static bool sendSignalToThread(int thread_id, int signo);
 
     static void* safeAlloc(size_t size);
@@ -135,7 +140,7 @@ class OS {
     static u64 getTotalCpuTime(u64* utime, u64* stime);
 
     static int createMemoryFile(const char* name);
-    static void copyFile(int src_fd, int dst_fd, off_t offset, size_t size);
+    static bool copyFile(int src_fd, int dst_fd, off_t offset, size_t size);
     static void freePageCache(int fd, off_t start_offset);
     static int mprotect(void* addr, size_t size, int prot);
 

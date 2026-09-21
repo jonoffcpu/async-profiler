@@ -146,3 +146,41 @@ TEST_CASE(Parse_external_signal_event) {
     ASSERT_EQ(args._event, EVENT_SIGNAL);
     ASSERT_EQ(args._interval, 25000000);
 }
+
+TEST_CASE(Parse_signal_cookie_arguments) {
+    Arguments args;
+    char argument[] = "stop,signalcookie,signalid=01234567-89ab-cdef-0123-456789abcdef,signalepoch=4294967295";
+    Error error = args.parse(argument);
+    ASSERT_EQ(error.message(), NULL);
+    ASSERT_EQ(args._signal_cookie, true);
+    ASSERT_EQ(args._signal_id, "01234567-89ab-cdef-0123-456789abcdef");
+    ASSERT_EQ(args._signal_epoch, 0xffffffffULL);
+}
+
+TEST_CASE(Parse_signal_cookie_delivery) {
+    Arguments queued;
+    char queued_argument[] = "start,signalcookie=queued,cookiesignal=auto";
+    ASSERT_FALSE(queued.parse(queued_argument));
+    ASSERT_EQ(queued._signal_cookie_delivery, SIGNAL_COOKIE_QUEUED);
+    ASSERT_EQ(queued._cookie_signal, 0);
+
+    Arguments coalescing;
+    char coalescing_argument[] = "start,signalcookie=coalescing,cookiesignal=29";
+    ASSERT_FALSE(coalescing.parse(coalescing_argument));
+    ASSERT_EQ(coalescing._signal_cookie_delivery, SIGNAL_COOKIE_COALESCING);
+    ASSERT_EQ(coalescing._cookie_signal, 29);
+}
+
+TEST_CASE(Parse_signal_cookie_rejects_bad_epoch) {
+    const char* invalid_arguments[] = {
+        "stop,signalcookie,signalepoch=0",
+        "stop,signalcookie,signalepoch=4294967296",
+        "stop,signalcookie,signalepoch=1x",
+    };
+    for (size_t i = 0; i < sizeof(invalid_arguments) / sizeof(invalid_arguments[0]); i++) {
+        Arguments args;
+        Error error = args.parse(invalid_arguments[i]);
+        ASSERT(error);
+        ASSERT_EQ(strcmp(error.message(), "signalepoch must be an unsigned 32-bit value"), 0);
+    }
+}

@@ -13,6 +13,7 @@ import jdk.jfr.RecordingState;
 
 import java.io.IOException;
 import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.text.ParseException;
 import java.util.StringTokenizer;
@@ -36,6 +37,9 @@ class JfrSync implements FlightRecorderListener {
     private static final int NO_HEAP_SUMMARY = 16;
 
     private static volatile Recording masterRecording;
+    private static volatile Recording stoppingRecording;
+    private static volatile Recording dumpedRecording;
+    private static volatile Path masterDestination;
 
     private JfrSync() {
     }
@@ -46,8 +50,23 @@ class JfrSync implements FlightRecorderListener {
 
     @Override
     public void recordingStateChanged(Recording recording) {
-        if (recording == masterRecording && recording.getState() == RecordingState.STOPPED) {
-            masterRecording = null;
+        boolean stopped = recording.getState() == RecordingState.STOPPED;
+        boolean owned = recording == masterRecording || recording == stoppingRecording;
+        boolean expectedDestination = masterDestination != null &&
+                masterDestination.equals(recording.getDestination());
+        if (stopped && owned && expectedDestination) {
+            // PlatformRecording sends STOPPED only after dumpStopped succeeds.
+            // Keep this recording-specific witness even after the public state
+            // later becomes CLOSED.
+            dumpedRecording = recording;
+        }
+        if (stopped && recording == masterRecording && recording != stoppingRecording) {
+            // A matching successful dump can release Java ownership before the
+            // native callback. Keep a redirected recording owned so native stop
+            // observes the missing destination witness and reports failure.
+            if (expectedDestination) {
+                masterRecording = null;
+            }
             stopProfiler();
         }
     }
@@ -69,11 +88,26 @@ class JfrSync implements FlightRecorderListener {
         }
 
         masterRecording = recording;
-
-        recording.setDestination(Paths.get(fileName));
-        recording.setToDisk(true);
-        recording.setDumpOnExit(true);
-        recording.start();
+        dumpedRecording = null;
+        try {
+            Path destination = Paths.get(fileName).toAbsolutePath().normalize();
+            masterDestination = destination;
+            recording.setDestination(destination);
+            recording.setToDisk(true);
+            recording.setDumpOnExit(true);
+            recording.start();
+        } catch (IOException | RuntimeException | Error e) {
+            if (masterRecording == recording) {
+                masterRecording = null;
+            }
+            masterDestination = null;
+            try {
+                recording.close();
+            } catch (RuntimeException closeError) {
+                e.addSuppressed(closeError);
+            }
+            throw e;
+        }
     }
 
     private static void enableEvent(Recording recording, String event) {
@@ -93,17 +127,23 @@ class JfrSync implements FlightRecorderListener {
         Recording recording = masterRecording;
         if (recording != null) {
             // Disable state change notification before stopping
+            stoppingRecording = recording;
             masterRecording = null;
             try {
-                recording.stop();
-            } catch (IllegalStateException e) {
-                // Workaround the JDK issue: JFR shutdown hook may stop the recording concurrently
-                // then populate the target file outside the state lock.
-                // Once the file is completely written, the recording state is changed to CLOSED.
+                try {
+                    recording.stop();
+                } catch (IllegalStateException e) {
+                    // The JFR shutdown hook may already be stopping the recording.
+                }
+                // A destination dump failure can be swallowed by the JDK recording
+                // implementation while leaving the recording STOPPED. CLOSED plus
+                // the recording-specific STOPPED callback is the completion witness.
                 for (int pause = 10; recording.getState() != RecordingState.CLOSED && pause < 1000; pause *= 2) {
                     LockSupport.parkNanos(pause * 1_000_000L);
                 }
-                return recording.getState() == RecordingState.CLOSED;
+                return recording == dumpedRecording && recording.getState() == RecordingState.CLOSED;
+            } finally {
+                stoppingRecording = null;
             }
         }
         return true;

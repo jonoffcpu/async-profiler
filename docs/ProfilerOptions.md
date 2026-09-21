@@ -52,6 +52,10 @@ The below options are `action`s for async-profiler and common for both `asprof` 
 | `--sched`            | `sched`            | Group threads by Linux-specific scheduling policy: BATCH/IDLE/OTHER.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `--cstack MODE`      | `cstack=MODE`      | How to walk native frames (C stack). Possible modes are `fp` (Frame Pointer), `dwarf` (DWARF unwind info), `vm`, `vmx` (HotSpot VM Structs) and `no` (do not collect C stack).<br><br>By default, C stack is shown in cpu, ctimer, wall-clock and perf-events profiles. Java-level events like `alloc` and `lock` collect only Java stack.                                                                                                                                                                                                  |
 | `--signal NUM`       | `signal=NUM`       | Use an alternative signal for CPU, wall clock, or external signal profiling. To change both CPU and wall clock signals, specify two numbers separated by a slash: `--signal SIGCPU/SIGWALL`. External signal profiling uses the first number and defaults to `SIGPROF`.                                                                                                                                                                                                                                                                       |
+| `--signalcookie[=MODE]` | `signalcookie[=MODE]` | Record 64-bit cookies delivered by an external signal as `profiler.SignalSample` JFR events. `MODE` is `queued` (the default) or `coalescing`. See [Correlated external signal samples](#correlated-external-signal-samples). |
+| `--cookiesignal NUM` | `cookiesignal=NUM` | Select the dedicated signal used by `signalcookie`; `auto` is the default. The number must belong to the selected delivery mode's signal pool. |
+| `--signalid UUID`    | `signalid=UUID`    | Canonical lowercase session UUID required when starting `signalcookie`. |
+| `--signalepoch NUM`  | `signalepoch=NUM`  | Capture epoch returned by `start`. Optional for an identity-guarded `stop`; required for `status --signalcookie --signalid` lookups. |
 | `--clock SOURCE`     | `clock=SOURCE`     | Clock source for JFR timestamps: `tsc` (default) or `monotonic` (equivalent for `CLOCK_MONOTONIC`).                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `--begin function`   | `begin=FUNCTION`   | Automatically start profiling when the specified native function is executed.                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `--end function`     | `end=FUNCTION`     | Automatically stop profiling when the specified native function is executed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
@@ -76,6 +80,162 @@ The below options are `action`s for async-profiler and common for both `asprof` 
 | `--jfrsync CONFIG`   | `jfrsync[=CONFIG]` | Start Java Flight Recording with the given configuration synchronously with the profiler. The output .jfr file will include all regular JFR events, except that execution samples will be obtained from async-profiler. This option implies `-o jfr`.<br>`CONFIG` is a predefined JFR profile or a JFR configuration file (.jfc) or a list of JFR events started with `+`.<br>Example: `asprof -e cpu --jfrsync profile -f combined.jfr 8983`<br>Individual event settings may be specified as `+event#setting=value`                                                  |
 | `--proc INTERVAL`    | `proc=INTERVAL`    | Collect statistics about other processes in the system. Default sampling interval is 30s.                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `--all`              | `all`              | Shorthand for enabling `cpu`, `wall`, `alloc`, `live`, `lock`, `nativelock`, `nativemem`, and `proc` profiling simultaneously. This can be combined with `--alloc 2m --lock 10ms` etc. to pass custom interval/threshold. It is also possible to combine it with `-e` argument to change the type of event being collected (default is `cpu`). This is not recommended for production, especially for continuous profiling.                                                                                                                                            |
+
+### Correlated external signal samples
+
+`signalcookie` lets a tool outside the JVM, such as a BPF program watching
+scheduler or I/O events, ask for a stack sample of a thread and tag the request
+with a 64-bit *cookie*. Every accepted cookie is stored in the recording as a
+`profiler.SignalSample` JFR event carrying the stack and the cookie, so the
+tool's own observations can be joined with Java stacks afterwards, using the
+cookie as the key.
+
+Cookie capture is an addition to a normal recording: it runs alongside the
+`cpu`, `wall`, `alloc`, `lock` and `jfrsync` events in the same JFR file.
+Use `event=signal` together with `signalcookie` for a cookie-only recording.
+It is available on 64-bit Linux and requires JFR output.
+
+#### What is recorded
+
+Whenever the reserved signal is delivered with a valid cookie while a capture
+is active, the profiler writes a `profiler.SignalSample` event with:
+
+- `stackTrace` and `eventThread`: the stack of the thread that received the
+  signal, taken at signal delivery. The profiler does not reconstruct the stack
+  at the earlier event that made the producer send the signal.
+- `correlationId`: the cookie, unchanged.
+- `monotonicTimeNanos`: `CLOCK_MONOTONIC` time of delivery, comparable with
+  timestamps taken by the producer, e.g. with `bpf_ktime_get_ns()`.
+
+Two bookkeeping events accompany the samples. `profiler.SignalCapture` is
+written in every chunk with the session id, capture epoch, signal number and
+delivery mode. `profiler.SignalCaptureStats` is written when the capture stops
+and holds the counters listed under [Sending cookies](#sending-cookies).
+`jfrconv` does not include signal samples in flame graphs; read them with
+`jfr print`, the `jdk.jfr.consumer` API or `one.jfr.JfrReader`.
+
+#### Starting a capture
+
+Each capture is identified by a session UUID (`signalid`, canonical lowercase
+form) chosen by the controller and a capture *epoch* assigned by the profiler.
+`start` returns both, together with the reserved signal number:
+
+```
+$ asprof start -e cpu -i 10ms --wall 10ms -o jfr -f profile.jfr \
+    --signalcookie --signalid 01234567-89ab-cdef-0123-456789abcdef 8983
+signal-capture-v1 id=01234567-89ab-cdef-0123-456789abcdef signal=34 epoch=1 delivery=queued
+```
+
+`AsyncProfiler.execute()` returns the same line when the capture is started
+through the Java API. The epoch grows with every capture started in the
+process and is never reused; it is what makes cookies from an earlier capture
+recognizable as stale. The identity is fixed before the JFR file or a `jfrsync`
+JVM recording is created, and the handler starts accepting cookies only once
+every part of the recording is ready, so a cookie queued during startup cannot
+end up in a half-initialized recording.
+
+#### Sending cookies
+
+A cookie is an unsigned 64-bit value: the epoch returned by `start` in the
+high 32 bits and a producer-chosen, nonzero sequence number in the low 32 bits.
+Send it as the signal value:
+
+- from user space with `sigqueue(pid, signal, value)`, or with
+  `rt_tgsigqueueinfo(pid, tid, signal, &info)` and `si_code = SI_QUEUE` to
+  sample a specific thread;
+- from BPF with `bpf_send_signal_task()`, which delivers the value with
+  `si_code = SI_KERNEL`.
+
+A process-directed signal is delivered to an arbitrary thread that does not
+block it, so use thread-directed delivery when a particular thread matters.
+
+Signals that fail validation are counted but produce no sample:
+
+| Counter            | Meaning                                                             |
+|--------------------|---------------------------------------------------------------------|
+| `admitted`         | Signals that reached the handler while the capture was active       |
+| `invalid-code`     | `si_code` other than `SI_QUEUE` or `SI_KERNEL`, e.g. a plain `kill` |
+| `zero-cookie`      | Cookie value 0                                                      |
+| `zero-sequence`    | Low 32 bits are 0                                                   |
+| `stale-epoch`      | High 32 bits do not match the current epoch                         |
+| `accepted`         | Cookies that passed all checks                                      |
+| `capture-failures` | Accepted cookies whose stack could not be recorded                  |
+| `submitted`        | `profiler.SignalSample` events written                              |
+
+#### Checking status and stopping
+
+`status --signalcookie` prints the active capture in the same format as
+`start`, `signal-capture-v1 inactive` when no capture is running, or
+`signal-capture-v1 busy mode=other` when the profiler is running without cookie
+capture.
+
+A capture can only be stopped by a controller that knows its identity. A plain
+`stop` is rejected while a capture is active; pass the session id and, optionally,
+the epoch:
+
+```
+$ asprof stop --signalcookie --signalid 01234567-89ab-cdef-0123-456789abcdef --signalepoch 1 8983
+signal-capture-v1 stopped id=01234567-89ab-cdef-0123-456789abcdef signal=34 epoch=1 delivery=queued admitted=6 invalid-code=1 zero-cookie=1 zero-sequence=1 stale-epoch=1 accepted=2 capture-failures=0 submitted=2 finalized=true stopped-at=1234567890123 reason=guarded-stop
+```
+
+The receipt contains the counters from the table above, `stopped-at` (the
+`CLOCK_MONOTONIC` time after which no signal was admitted), `reason`
+(`guarded-stop`, `timeout`, `vm-shutdown` or `finalization-failed`) and
+`finalized`, which is `false` when the JFR file could not be completed. A wrong
+id or epoch answers `signal-capture-v1 mismatch` and leaves the capture running.
+
+The receipt of the most recently completed capture is retained. `stop` with that
+identity, or `status --signalcookie --signalid ID --signalepoch N`, returns it
+again, so a controller that missed the original response or finds the capture
+already ended by a timeout can still collect the result.
+
+#### Signal selection and delivery modes
+
+Cookies use a signal of their own, which is never shared with CPU or wall-clock
+sampling.
+
+- `queued` (default) reserves an unused real-time signal from
+  `SIGRTMIN..SIGRTMAX`. Real-time signals are queued, so every `sigqueue()` call
+  is delivered with its own value.
+- `coalescing` reserves an unused `SIGSTKFLT` or `SIGPWR`. These are standard
+  signals: while one instance is pending, further instances are merged and
+  their cookies are lost. Use this mode only when real-time signals are not
+  available.
+
+`cookiesignal=NUM` selects a specific signal instead of the first free one; it
+must belong to the pool of the chosen mode. The profiler only takes signals with
+the default disposition: it never replaces an application handler or `SIG_IGN`,
+and `start` fails if no suitable signal is free. The handler is installed with
+`SA_SIGINFO | SA_RESTART` and stays installed, but closed, for the rest of the
+process lifetime, so a signal still pending after the capture ends cannot
+terminate the JVM through its default disposition.
+
+The first capture in a process fixes the signal and the delivery mode. Later
+captures reuse them, and a request for a different mode or `cookiesignal` fails
+instead of silently switching.
+
+#### Delivery caveats
+
+- Signal masks are per thread. The profiler unblocks the reserved signal in
+  threads created while it is running, but a thread that blocks the signal
+  itself receives it only after unblocking, possibly during a later capture,
+  where it is counted as `stale-epoch`.
+- Queued real-time signals are limited by `RLIMIT_SIGPENDING`; current usage is
+  the `SigQ` line in `/proc/<pid>/status`. Signals above the limit are dropped
+  by the kernel without the profiler noticing.
+- A successful send request from BPF does not guarantee that the signal was
+  queued or delivered, because the kernel may defer the send. Compare the
+  producer's own log with the `SignalSample` cookies and the counters to find
+  requests that produced no sample.
+
+#### Restrictions
+
+- Requires 64-bit Linux, JFR output and the `start` action; `resume` is not
+  supported.
+- `loop` and `nostop` are rejected, and `dump` is only allowed with JFR output
+  while a capture is active.
+- `begin`/`end` traps and `filter` apply to the primary event only; cookies are
+  recorded for the whole capture.
 
 ## Options applicable to FlameGraph and Tree view outputs only
 

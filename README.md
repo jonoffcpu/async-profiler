@@ -2,7 +2,7 @@
 
 > [!NOTE]
 > This is a fork of [async-profiler](https://github.com/async-profiler/async-profiler) that adds
-> externally triggered signal profiling for use by [lhotari/jonoffcpu](https://github.com/lhotari/jonoffcpu).
+> externally triggered signal profiling for use by [jonoffcpu/jonoffcpu](https://github.com/jonoffcpu/jonoffcpu).
 > jonoffcpu contains an eBPF program that samples off-CPU intervals from the Linux scheduler and
 > sends the resumed thread a signal carrying a 64-bit correlation id. This fork records that id
 > together with the thread's stack as a `profiler.SignalSample` JFR event, so the scheduler data

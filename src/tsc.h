@@ -80,6 +80,13 @@ static bool cpuHasGoodTimestampCounter() {
 #endif
 
 
+// The clock the JVM uses for JFR timestamps, once async-profiler has synchronized with it
+enum JvmClock {
+    JVM_CLOCK_UNKNOWN,
+    JVM_CLOCK_TSC,      // the time stamp counter, with an offset
+    JVM_CLOCK_NANOTIME  // the monotonic clock, counted from the JVM's start
+};
+
 class TSC {
   private:
     static bool _initialized;
@@ -87,8 +94,10 @@ class TSC {
     static bool _enabled;
     static u64 _offset;
     static u64 _frequency;
+    static JvmClock _jvm_clock;
+    static u64 _nanotime_offset;
 
-    static bool syncWithJvm();
+    static void syncWithJvm();
 
   public:
     static void enable(Clock clock);
@@ -97,8 +106,15 @@ class TSC {
         return TSC_SUPPORTED && _enabled;
     }
 
+    // True when ticks() has the origin and the frequency of the JVM's JFR clock, so that a JFR chunk
+    // written with them lines up with the JVM's own chunks: JDK 22+ readers convert every chunk of
+    // a file with the first chunk's origin.
+    static bool alignedWithJvm() {
+        return _jvm_clock == JVM_CLOCK_NANOTIME || (_jvm_clock == JVM_CLOCK_TSC && enabled());
+    }
+
     static u64 ticks() {
-        return enabled() ? rdtsc() - _offset : OS::nanotime();
+        return enabled() ? rdtsc() - _offset : OS::nanotime() - _nanotime_offset;
     }
 
     // Ticks per second.

@@ -1455,6 +1455,10 @@ Error FlightRecorder::start(Arguments& args, bool reset) {
     }
 
     TSC::enable(args._clock);
+    if (args._jfr_sync != NULL && !TSC::alignedWithJvm()) {
+        Log::warn("The profiler's clock is not aligned with the JVM's JFR clock: "
+                  "JDK 22+ readers mistime the profiler's events in the synchronized recording");
+    }
 
     int fd = open(filename, O_CREAT | O_RDWR | (reset ? O_TRUNC : 0), 0644);
     if (fd == -1) {

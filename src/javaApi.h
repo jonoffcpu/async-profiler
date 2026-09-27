@@ -19,7 +19,7 @@ class RecordingAPI {
     static jclass _recording_class;
     static jfieldID _state_field;
     static jmethodID _update_clock_method;
-    static bool _tsc_enabled;
+    static bool _jvm_aligned;
 
     static void updateClock(JNIEnv* env);
 

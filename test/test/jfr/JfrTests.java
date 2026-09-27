@@ -16,6 +16,10 @@ import one.profiler.test.Test;
 import one.profiler.test.TestProcess;
 import test.alloc.Hello;
 
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
@@ -306,6 +310,78 @@ public class JfrTests {
             Assert.isGreater(ticksPerSec1, ticksPerSec2 * 0.95);
             Assert.isLess(ticksPerSec1, ticksPerSec2 * 1.05);
         }
+    }
+
+    /**
+     * With jfrsync, the profiler's chunk is appended to the JVM's recording, and JDK 22+ readers
+     * convert every chunk of a file with the first chunk's clock origin. The profiler's events must
+     * therefore fall within the recording when the whole file is read, which needs the profiler's clock
+     * to have the JVM's origin: the time stamp counter when the JVM uses it, which it can only on x86,
+     * and otherwise the monotonic clock counted from the JVM's start.
+     */
+    @Test(mainClass = CpuLoad.class, os = Os.LINUX, output = true, nameSuffix = "default",
+            agentArgs = "start,event=cpu,interval=10ms,file=%f.jfr,jfrsync")
+    @Test(mainClass = CpuLoad.class, os = Os.LINUX, output = true, nameSuffix = "noFastTimeStamps",
+            jvmArgs = "-XX:+UnlockExperimentalVMOptions -XX:-UseFastUnorderedTimeStamps",
+            agentArgs = "start,event=cpu,interval=10ms,file=%f.jfr,jfrsync")
+    @Test(mainClass = CpuLoad.class, os = Os.LINUX, output = true, nameSuffix = "monotonic",
+            agentArgs = "start,event=cpu,interval=10ms,clock=monotonic,file=%f.jfr,jfrsync")
+    public void clockAlignment(TestProcess p) throws Exception {
+        p.waitForExit();
+        assert p.exitCode() == 0;
+
+        // A JVM that counts JFR ticks with the time stamp counter, above 1 GHz, can't be matched by
+        // clock=monotonic; the profiler then warns instead
+        ByteBuffer jvmChunk = ByteBuffer.wrap(Files.readAllBytes(p.getFile("%f").toPath()), 0, 64);
+        boolean jvmTsc = jvmChunk.getLong(56) != 1_000_000_000L;
+        boolean aligned = !(jvmTsc && p.test().agentArgs().contains("clock=monotonic"));
+
+        Instant[] recording = recordingInterval(p.getFile("%f").toPath());
+        Instant from = recording[0].minusSeconds(1);
+        Instant to = recording[1].plusSeconds(1);
+        int samples = 0;
+        int outside = 0;
+        Instant firstOutside = null;
+        try (RecordingFile recordingFile = new RecordingFile(p.getFile("%f").toPath())) {
+            while (recordingFile.hasMoreEvents()) {
+                RecordedEvent event = recordingFile.readEvent();
+                if (event.getEventType().getName().equals("jdk.ExecutionSample")) {
+                    samples++;
+                }
+                Instant time = event.getStartTime();
+                if (time.isBefore(from) || time.isAfter(to)) {
+                    outside++;
+                    if (firstOutside == null) {
+                        firstOutside = time;
+                    }
+                }
+            }
+        }
+        Assert.isGreater(samples, 0);
+        if (aligned) {
+            assert outside == 0 : outside + " event(s) outside the recording " + recording[0] + " - "
+                    + recording[1] + ", the first at " + firstOutside;
+        } else {
+            assert outside > 0;
+            assert p.readFile(TestProcess.STDOUT).contains("not aligned with the JVM's JFR clock");
+        }
+    }
+
+    // The earliest start and the latest end in the chunk headers of a JFR file
+    private static Instant[] recordingInterval(Path file) throws IOException {
+        ByteBuffer buffer = ByteBuffer.wrap(Files.readAllBytes(file));
+        long start = Long.MAX_VALUE;
+        long end = Long.MIN_VALUE;
+        for (int chunk = 0; chunk + 64 <= buffer.limit(); ) {
+            long size = buffer.getLong(chunk + 8);
+            long startNanos = buffer.getLong(chunk + 32);
+            long durationNanos = buffer.getLong(chunk + 40);
+            start = Math.min(start, startNanos);
+            end = Math.max(end, startNanos + durationNanos);
+            assert size > 0 : "Invalid chunk size at " + chunk;
+            chunk += (int) size;
+        }
+        return new Instant[]{Instant.ofEpochSecond(0, start), Instant.ofEpochSecond(0, end)};
     }
 
     private static void assertRateLimited(int actual, int limit, int duration) {

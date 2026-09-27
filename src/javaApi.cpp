@@ -235,15 +235,17 @@ void JavaAPI::registerNatives(jvmtiEnv* jvmti, JNIEnv* jni) {
 jclass RecordingAPI::_recording_class = nullptr;
 jfieldID RecordingAPI::_state_field;
 jmethodID RecordingAPI::_update_clock_method;
-bool RecordingAPI::_tsc_enabled = false;
+bool RecordingAPI::_jvm_aligned = false;
 
 void RecordingAPI::updateClock(JNIEnv* env) {
-    if (_tsc_enabled == TSC::enabled()) return;
-    _tsc_enabled = TSC::enabled();
+    // Recording.timestamp() reads the JVM's JFR clock when async-profiler's clock is aligned with it,
+    // with either the time stamp counter or the monotonic clock, and System.nanoTime() otherwise
+    if (_jvm_aligned == TSC::alignedWithJvm()) return;
+    _jvm_aligned = TSC::alignedWithJvm();
 
     do {
         jobject lookup = nullptr;
-        if (_tsc_enabled) {
+        if (_jvm_aligned) {
             jclass lookup_class = env->FindClass("java/lang/invoke/MethodHandles$Lookup");
             if (lookup_class == nullptr) break;
 
